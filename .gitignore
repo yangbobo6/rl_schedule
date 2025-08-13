@@ -1,0 +1,27 @@
+# Python 编译文件
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# 虚拟环境
+.venv/
+venv/
+ENV/
+env/
+
+# IDE 配置文件
+.idea/
+.vscode/
+
+# 临时文件
+*.log
+*.tmp
+*.swp
+
+# 结果输出文件（可根据需要调整）
+results/
+
+# 系统文件
+.DS_Store
+Thumbs.db
