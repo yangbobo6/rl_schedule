@@ -19,12 +19,12 @@ class Hyperparameters:
     NUM_TASKS = 10
     MAX_QUBITS_PER_TASK = 6
     # PPO 训练参数
-    LEARNING_RATE = 3e-4
+    LEARNING_RATE = 5e-4
+    ENTROPY_BETA = 0.02
     GAMMA = 0.99  # 折扣因子
     GAE_LAMBDA = 0.95  # GAE平滑参数
     PPO_EPSILON = 0.2  # PPO裁剪系数
     CRITIC_DISCOUNT = 0.5  # Critic loss的系数
-    ENTROPY_BETA = 0.01  # 熵奖励的系数
     PPO_EPOCHS = 4  # 每次更新时，用同一批数据训练的次数
     MINI_BATCH_SIZE = 64
     ROLLOUT_LENGTH = 2048  # 收集多少步经验后进行一次更新
@@ -138,7 +138,7 @@ def main():
         final_avg_fidelity = 0
         final_total_crosstalk = 0
 
-        env.reset()
+        initial_obs_dict, info = env.reset()
         episode_reward = 0
 
         for task_id in range(env.num_tasks):
@@ -151,7 +151,12 @@ def main():
                 global_step += 1
 
                 # 1. 获取观察
-                obs_dict = env._get_obs(task_id, placement_in_progress)
+                if task_id == 0 and i == 0:
+                    # 对于整个episode的第一次决策，使用reset返回的obs
+                    obs_dict = initial_obs_dict
+                else:
+                    # 对于后续决策，正常调用_get_obs
+                    obs_dict = env._get_obs(task_id, placement_in_progress)
 
                 # 将Numpy观察转换为Torch张量
                 obs_tensor = {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(device) for k, v in
@@ -206,9 +211,9 @@ def main():
         # --- 计算并记录最终的调度方案指标 ---
         if env.schedule_plan:
             final_makespan = max(t['end_time'] for t in env.schedule_plan)
-            fidelities = [t['fidelity'] for t in env.schedule_plan]
-            final_avg_fidelity = np.prod(fidelities) ** (1 / len(fidelities)) if fidelities else 0
-            final_total_crosstalk = sum(t['crosstalk'] for t in env.schedule_plan)
+            # fidelities = [t['fidelity'] for t in env.schedule_plan]
+            # final_avg_fidelity = np.prod(fidelities) ** (1 / len(fidelities)) if fidelities else 0
+            # final_total_crosstalk = sum(t['crosstalk'] for t in env.schedule_plan)
 
         print(f"Episode {episode}: Total Reward = {episode_reward:.4f}")
 
