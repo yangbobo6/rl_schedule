@@ -336,7 +336,6 @@ class QuantumSchedulingEnv(gym.Env):
         self.current_step += 1
 
         # 估算和记录
-        # TODO: 更复杂的模型
         duration = task.estimated_duration
         end_time = start_time + duration
         fidelity = self._estimate_fidelity(task, mapping)
