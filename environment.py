@@ -165,21 +165,21 @@ class QuantumSchedulingEnv(gym.Env):
 
         # b. 交互图的统计特征 (空间布局约束)
         graph = task.interaction_graph
-        num_edges = graph.number_of_edges()
+        num_edges = graph.number_of_edges()  # 边
         degrees = [d for n, d in graph.degree()]
-        mean_degree = np.mean(degrees) if degrees else 0
+        mean_degree = np.mean(degrees) if degrees else 0  # 平均度数（每个节点连了多少条边，取平均）
 
-        max_edges = task.num_qubits * (task.num_qubits - 1) / 2
+        max_edges = task.num_qubits * (task.num_qubits - 1) / 2   # 完全图最大边数
         num_edges_norm = num_edges / max_edges if max_edges > 0 else 0
-        max_degree = task.num_qubits - 1
+        max_degree = task.num_qubits - 1   # 最大度 节点数-1
         mean_degree_norm = mean_degree / max_degree if max_degree > 0 else 0
 
         task_embedding = np.array([
             num_q_norm, duration_norm,
             num_edges_norm, mean_degree_norm
-        ], dtype=np.float32)
+        ], dtype=np.float32)   # [比特数，任务持续时间，边，度]
 
-        # --- 3. 放置掩码 (Placement Mask) ---
+        # --- 3. 放置掩码 (Placement Mask) 记录了当前任务中哪些逻辑比特已经映射到物理比特 构造一个长度为 num_qubits 的 0/1 向量
         placement_mask = np.zeros(self.num_qubits, dtype=np.int8)
         for physical_q_id in placement_in_progress.values():
             placement_mask[self.qubit_id_to_idx[physical_q_id]] = 1

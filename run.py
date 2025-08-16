@@ -27,7 +27,7 @@ class Hyperparameters:
     CRITIC_DISCOUNT = 0.5  # Critic loss的系数
     PPO_EPOCHS = 4  # 每次更新时，用同一批数据训练的次数
     MINI_BATCH_SIZE = 64
-    ROLLOUT_LENGTH = 2048  # 收集多少步经验后进行一次更新
+    ROLLOUT_LENGTH = 2048  # 收集多少步经验后进行一次网络更新
     # 训练过程参数
     MAX_EPISODES = 1000
 
@@ -164,13 +164,15 @@ def main():
 
                 # 2. 智能体决策
                 with torch.no_grad():
+                    # 模型输出的每个动作（这里是每个物理比特）对应的未归一化的分数
+                    # Critic 输出的状态价值估计，表示当前状态预计能获得的未来回报
                     logits, value = model(obs_tensor)
 
                 # 应用掩码，防止选择已占用的比特
                 placement_mask = torch.tensor(obs_dict["placement_mask"], dtype=torch.bool).to(device)
                 logits[0, placement_mask] = -1e8  # 将非法动作的logit设为极小值
 
-                probs = Categorical(logits=logits)
+                probs = Categorical(logits=logits) # PyTorch 的 Categorical 分布对象，把 logits 转换成概率分布
                 action = probs.sample()  # 采样一个动作 (物理比特的索引)
                 log_prob = probs.log_prob(action)
 
@@ -183,7 +185,7 @@ def main():
                 rollout_buffer["dones"].append(False)
 
                 # 4. 更新进行中的放置
-                physical_qubit_id = env.idx_to_qubit_id[action.item()]
+                physical_qubit_id = env.idx_to_qubit_id[action.item()]  # 将action的下表（例如2）转换为qubit_id 例如(2,3)
                 placement_in_progress[i] = physical_qubit_id
 
                 # 5. 检查是否需要更新网络
