@@ -134,6 +134,8 @@ def main():
     for episode in range(args.MAX_EPISODES):
         # --- 宏观循环: 调度一个完整的方案 ---
         # 在Episode开始前，记录一下最终的统计数据
+        episode_reward_sum = 0.0  # 用于累加本episode的总奖励
+
         final_makespan = 0
         final_avg_fidelity = 0
         final_total_crosstalk = 0
@@ -202,13 +204,20 @@ def main():
 
             full_action = {"task_id": task_id, "mapping": final_mapping, "start_time": start_time}
             _, reward, terminated, _, _ = env.step(full_action)
-            episode_reward += reward  # reward只在最后一步非0
+            episode_reward_sum += reward  # 累加到episode总奖励
+
+            # --- 将宏观步骤的奖励分配给微观步骤 ---
+            # 这是关键一步：我们将刚刚收到的中间奖励，
+            # 平均分配或者全部归功于导致它的最后一个微观动作。
+            # 将其归功于最后一个微观动作更简单且常用。
+            if rollout_buffer["rewards"]:
+                rollout_buffer["rewards"][-1] += reward
 
         # --- Episode 结束 ---
-        # 更新最后一步的奖励和完成状态
-        if rollout_buffer["rewards"]:
-            rollout_buffer["rewards"][-1] = episode_reward
-            rollout_buffer["dones"][-1] = True
+        # 此时episode_reward_sum就是TensorBoard中要记录的值
+        # rollout_buffer中已经包含了所有中间奖励和最终奖
+        print(f"Episode {episode}: Total Reward = {episode_reward_sum:.4f}")
+        writer.add_scalar("charts/episode_reward", episode_reward_sum, episode)
 
         # --- 计算并记录最终的调度方案指标 ---
         if env.schedule_plan:
@@ -217,7 +226,6 @@ def main():
             # final_avg_fidelity = np.prod(fidelities) ** (1 / len(fidelities)) if fidelities else 0
             # final_total_crosstalk = sum(t['crosstalk'] for t in env.schedule_plan)
 
-        print(f"Episode {episode}: Total Reward = {episode_reward:.4f}")
 
         # 每隔N个episode，或者在训练结束时，画一张图
         if episode % 50 == 0 or episode == args.MAX_EPISODES - 1:
@@ -227,7 +235,6 @@ def main():
                 # 调用绘图函数并传入路径
                 plot_schedule(env.schedule_plan, args.CHIP_SIZE, baseline_makespan,plot_save_path)
         # --- 写入TensorBoard日志 ---
-        writer.add_scalar("charts/episode_reward", episode_reward, episode)
         writer.add_scalar("charts/makespan", final_makespan, episode)
         writer.add_scalar("charts/avg_fidelity", final_avg_fidelity, episode)
         writer.add_scalar("charts/total_crosstalk", final_total_crosstalk, episode)

@@ -232,7 +232,7 @@ class QuantumSchedulingEnv(gym.Env):
 
     def step(self, action: Dict[str, Any]) -> Tuple[Dict, float, bool, bool, Dict]:
         """
-        【已修改】执行一步宏观调度（提交一个已规划好的任务）。
+        执行一步宏观调度（提交一个已规划好的任务）。
 
         这个方法现在原子地执行一个完整的任务调度计划，更新环境状态，
         并返回一个形式上的“下一步观察”。
@@ -240,6 +240,11 @@ class QuantumSchedulingEnv(gym.Env):
         Args:
             action (Dict[str, Any]): 一个包含 'task_id', 'mapping', 'start_time' 的字典。
         """
+        # --- 1. 记录执行动作前的状态 ---
+        makespan_before = 0
+        if self.schedule_plan:
+            makespan_before = max(t['end_time'] for t in self.schedule_plan)
+
         task_id = action["task_id"]
         mapping = action["mapping"]
         start_time = action["start_time"]
@@ -259,11 +264,6 @@ class QuantumSchedulingEnv(gym.Env):
         duration = task.estimated_duration
         end_time = start_time + duration
 
-        # 更新芯片资源预定
-        for physical_q_id in mapping.values():
-            self.chip_model[physical_q_id].booking_schedule.append((start_time, end_time))
-            self.chip_model[physical_q_id].booking_schedule.sort()  # 保持排序
-
         # 将完成的计划存入方案列表
         self.schedule_plan.append({
             "task_id": task_id,
@@ -275,11 +275,27 @@ class QuantumSchedulingEnv(gym.Env):
             # "crosstalk": self._calculate_crosstalk(mapping, start_time, end_time)
         })
 
+        # 更新芯片资源预定
+        for physical_q_id in mapping.values():
+            self.chip_model[physical_q_id].booking_schedule.append((start_time, end_time))
+            self.chip_model[physical_q_id].booking_schedule.sort()  # 保持排序
+
+        # --- 3. 计算中间奖励 ---
+        makespan_after = max(t['end_time'] for t in self.schedule_plan)
+        makespan_increase = makespan_after - makespan_before
+
+        # 核心奖励塑造：惩罚makespan的增加量。
+        # 我们用负值，所以这是个惩罚。为了让数值更显著，可以乘以一个系数。
+        intermediate_reward = -makespan_increase / 1000.0  # e.g., 除以1000将单位从ns级转为更小的数
+
         # --- 确定奖励和终止条件 ---
         terminated = (self.current_step == self.num_tasks)
-        reward = 0.0
+        final_reward_bonus = 0.0
         if terminated:
-            reward = self._calculate_final_reward()
+            final_reward_bonus = self._calculate_final_reward()
+
+        # 总奖励 = 中间奖励 + 最终通关奖励 (只在最后一步非0)
+        total_reward = intermediate_reward + final_reward_bonus
 
         # --- 生成下一步观察 (Next Observation) ---
         # 这个观察在我们的主循环中不会被直接用于决策，但需要保持API的完整性。
@@ -296,7 +312,7 @@ class QuantumSchedulingEnv(gym.Env):
             next_obs = self._get_obs(last_task_id, {})
 
         # Gymnasium API 返回 (obs, reward, terminated, truncated, info)
-        return next_obs, reward, terminated, False, {}
+        return next_obs, total_reward, terminated, False, {}
 
     def _estimate_fidelity(self, task: QuantumTask, mapping: Dict) -> float:
         # 占位符：基于所用比特的平均保真度
@@ -322,14 +338,14 @@ class QuantumSchedulingEnv(gym.Env):
         【已修改】只关注时间奖励。
         """
         if not self.schedule_plan:
-            return -1000.0
+            return -10.0
 
         makespan = max(t['end_time'] for t in self.schedule_plan)
 
         # 使用倒数形式以提供更强的非线性信号
-        reward = 1000.0 / makespan if makespan > 0 else 2000.0
+        bonus_reward = 100.0 / makespan if makespan > 0 else 200.0
 
-        return reward
+        return bonus_reward
 
     def render(self, mode='human'):
         """可视化当前调度方案"""
