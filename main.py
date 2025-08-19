@@ -94,7 +94,7 @@ class QuantumSchedulingEnv(gym.Env):
         # --- GNN编码器 (用于将任务交互图编码为向量) ---
         # 在实际项目中，这会是一个预训练或端到端训练的PyTorch/TensorFlow模型
         # 这里我们用一个虚拟的实现代替
-        # self.gnn_encoder = GNNEncoder(embedding_dim=16
+        # self.gnn_encoder.py = GNNEncoder(embedding_dim=16
 
         # --- 核心数据结构 ---
         self.task_generator = TaskGenerator(self.gate_times)

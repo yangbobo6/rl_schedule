@@ -1,7 +1,6 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-import networkx as nx
 from typing import List, Dict, Any, Tuple
 
 from models.physical_qubit import PhysicalQubit
@@ -16,7 +15,9 @@ class QuantumSchedulingEnv(gym.Env):
     """
     metadata = {'render_modes': ['human']}
 
-    def __init__(self, chip_size: Tuple[int, int] = (5, 5), num_tasks: int = 10, max_qubits_per_task: int = 6):
+    def __init__(self, chip_size: Tuple[int, int] , num_tasks: int,
+                 max_qubits_per_task: int, gnn_model, device, gate_times: Dict[str, float]
+                 ):
         super().__init__()
 
         self.chip_size = chip_size
@@ -24,26 +25,21 @@ class QuantumSchedulingEnv(gym.Env):
         self.num_tasks = num_tasks
         self.max_qubits_per_task = max_qubits_per_task  # 用于定义观察空间
 
-        # 定义一个假设的门时间表 (单位: ns)
-        self.gate_times = {
-            'u3': 50,  # 代表所有单比特门
-            'u2': 40,
-            'u1': 30,
-            'cx': 350,  # 控制非门
-            'id': 30,  # 空闲门
-            'measure': 1000,  # 测量
-        }
+
         # --- GNN编码器 (用于将任务交互图编码为向量) ---
         # 在实际项目中，这会是一个预训练或端到端训练的PyTorch/TensorFlow模型
         # 这里我们用一个虚拟的实现代替
         # self.gnn_encoder = GNNEncoder(embedding_dim=16
 
         # --- 核心数据结构 ---
-        self.task_generator = TaskGenerator(self.gate_times)
+        self.task_generator = TaskGenerator(gate_times, gnn_model, device)
         self.chip_model: Dict[Tuple[int, int], PhysicalQubit] = self._create_chip_model()
         self.task_pool: Dict[int, QuantumTask] = self._create_task_pool()
         self.schedule_plan: List[Dict] = []
         self.current_step = 0
+
+        # 观察空间的定义现在依赖于gnn_model的输出维度
+        gnn_output_dim = gnn_model.conv2.out_channels
 
         # --- 预计算用于归一化的值 ---
         self._precompute_normalization_factors()
@@ -70,12 +66,16 @@ class QuantumSchedulingEnv(gym.Env):
         D_TASK_SCALAR = 2
         # 我们仍然保留图的连接性信息，因为它对放置（空间布局）至关重要
         D_GRAPH_STATS = 2  # num_edges, mean_degree
-        D_TASK = D_TASK_SCALAR + D_GRAPH_STATS
+
+        D_GRAPH_EMBED = gnn_output_dim
+        D_TASK = D_TASK_SCALAR + D_GRAPH_EMBED
+
+        print(f"Env Init: D_QUBIT={D_QUBIT}, D_TASK={D_TASK}")
 
         self.observation_space = spaces.Dict({
             # 只保留与空间和时间最相关的特征
             "qubit_embeddings": spaces.Box(low=0.0, high=1.0, shape=(self.num_qubits, D_QUBIT), dtype=np.float32),
-            "current_task_embedding": spaces.Box(low=0.0, high=1.0, shape=(D_TASK,), dtype=np.float32),
+            "current_task_embedding": spaces.Box(low=-1.0, high=1.0, shape=(D_TASK,), dtype=np.float32),
             "placement_mask": spaces.Box(low=0, high=1, shape=(self.num_qubits,), dtype=np.int8),
             "logical_qubit_context": spaces.Box(low=0, high=1.0, shape=(2,), dtype=np.float32)
         })
@@ -129,15 +129,14 @@ class QuantumSchedulingEnv(gym.Env):
         if max_val == min_val: return 0.0
         return 2 * (value - min_val) / (max_val - min_val) - 1
 
-    def _get_obs(self, current_task_id: int = None, placement_in_progress: Dict[int, Tuple[int, int]] = None) -> Dict:
+    def _get_obs(self, current_task_id: int, placement_in_progress: Dict[int, Tuple[int, int]]) -> Dict:
         """
-        【已修改】生成一个简化的、聚焦于时间和空间布局的观察。
-        移除了所有与保真度和串扰直接相关的特征。
+        【已修正】生成一个简化的、聚焦于时间和空间布局的观察。
+        确保 task_embedding 的构建与 observation_space 的定义一致。
         """
         # --- 1. 芯片状态嵌入 (Qubit Embeddings) ---
         qubit_embeddings = np.zeros(self.observation_space["qubit_embeddings"].shape, dtype=np.float32)
 
-        # 动态获取当前调度方案的最大时间，用于归一化 next_available_time
         max_current_time = 1.0
         if self.schedule_plan:
             makespan_so_far = max(t['end_time'] for t in self.schedule_plan)
@@ -146,14 +145,9 @@ class QuantumSchedulingEnv(gym.Env):
 
         for q_id, qubit in self.chip_model.items():
             idx = self.qubit_id_to_idx[q_id]
-
-            # a. 位置特征 (空间)
             x_norm = qubit.id[0] / (self.chip_size[0] - 1)
             y_norm = qubit.id[1] / (self.chip_size[1] - 1)
-
-            # b. 时间特征
             next_avail_time_norm = qubit.get_next_available_time() / max_current_time
-
             qubit_embeddings[idx] = [x_norm, y_norm, next_avail_time_norm]
 
         # --- 2. 当前任务嵌入 (Current Task Embedding) ---
@@ -163,32 +157,28 @@ class QuantumSchedulingEnv(gym.Env):
         num_q_norm = task.num_qubits / self.norm_factors['max_task_qubits']
         duration_norm = task.estimated_duration / self.norm_factors['max_task_duration']
 
-        # b. 交互图的统计特征 (空间布局约束)
-        graph = task.interaction_graph
-        num_edges = graph.number_of_edges()  # 边
-        degrees = [d for n, d in graph.degree()]
-        mean_degree = np.mean(degrees) if degrees else 0  # 平均度数（每个节点连了多少条边，取平均）
+        scalar_features = np.array([num_q_norm, duration_norm], dtype=np.float32)
 
-        max_edges = task.num_qubits * (task.num_qubits - 1) / 2   # 完全图最大边数
-        num_edges_norm = num_edges / max_edges if max_edges > 0 else 0
-        max_degree = task.num_qubits - 1   # 最大度 节点数-1
-        mean_degree_norm = mean_degree / max_degree if max_degree > 0 else 0
+        # b. 从任务对象中获取预计算好的GNN嵌入
+        # 【核心修正】
+        graph_embedding = task.graph_embedding
 
-        task_embedding = np.array([
-            num_q_norm, duration_norm,
-            num_edges_norm, mean_degree_norm
-        ], dtype=np.float32)   # [比特数，任务持续时间，边，度]
+        # c. 将标量特征和GNN嵌入拼接起来
+        # 【核心修正】
+        task_embedding = np.concatenate([scalar_features, graph_embedding])
 
-        # --- 3. 放置掩码 (Placement Mask) 记录了当前任务中哪些逻辑比特已经映射到物理比特 构造一个长度为 num_qubits 的 0/1 向量
+        # --- 3. 放置掩码 (Placement Mask) ---
         placement_mask = np.zeros(self.num_qubits, dtype=np.int8)
-        for physical_q_id in placement_in_progress.values():
-            placement_mask[self.qubit_id_to_idx[physical_q_id]] = 1
+        if placement_in_progress:
+            for physical_q_id in placement_in_progress.values():
+                placement_mask[self.qubit_id_to_idx[physical_q_id]] = 1
 
         # --- 4. 当前逻辑比特上下文 (Logical Qubit Context) ---
-        current_logical_idx = len(placement_in_progress)
+        current_logical_idx = len(placement_in_progress) if placement_in_progress else 0
 
         connectivity_to_placed = 0
-        if current_logical_idx < task.num_qubits:
+        if current_logical_idx < task.num_qubits and placement_in_progress:
+            graph = task.interaction_graph
             for placed_logical_idx in placement_in_progress.keys():
                 if graph.has_edge(current_logical_idx, placed_logical_idx):
                     connectivity_to_placed += 1
@@ -211,6 +201,8 @@ class QuantumSchedulingEnv(gym.Env):
         """
         super().reset(seed=seed)
 
+        self.task_pool = self.task_generator.get_episode_tasks(self.num_tasks)
+
         self.current_step = 0
         self.schedule_plan = []
         for task in self.task_pool.values():
@@ -232,13 +224,7 @@ class QuantumSchedulingEnv(gym.Env):
 
     def step(self, action: Dict[str, Any]) -> Tuple[Dict, float, bool, bool, Dict]:
         """
-        执行一步宏观调度（提交一个已规划好的任务）。
-
-        这个方法现在原子地执行一个完整的任务调度计划，更新环境状态，
-        并返回一个形式上的“下一步观察”。
-
-        Args:
-            action (Dict[str, Any]): 一个包含 'task_id', 'mapping', 'start_time' 的字典。
+        引入了基于芯片利用率的“紧凑度”奖励。
         """
         # --- 1. 记录执行动作前的状态 ---
         makespan_before = 0
@@ -248,70 +234,67 @@ class QuantumSchedulingEnv(gym.Env):
         task_id = action["task_id"]
         mapping = action["mapping"]
         start_time = action["start_time"]
-
         task = self.task_pool[task_id]
 
-        # --- 验证 (简化版) ---
-        if task.is_scheduled:
-            # 在实际应用中，这里应该抛出错误或处理异常
-            # 因为这意味着我们的主循环逻辑有误
-            print(f"Warning: Task {task_id} was already scheduled. Overwriting.")
-
-        # --- 执行动作 ---
+        # --- 2. 正常执行动作 ---
         task.is_scheduled = True
         self.current_step += 1
-
         duration = task.estimated_duration
         end_time = start_time + duration
 
-        # 将完成的计划存入方案列表
+        # ... (更新 schedule_plan 和 chip_model) ...
         self.schedule_plan.append({
-            "task_id": task_id,
-            "mapping": mapping,
-            "start_time": start_time,
-            "end_time": end_time,
-            # 在这个简化版中，保真度和串扰可以不计算，以节省时间
-            # "fidelity": self._estimate_fidelity(task, mapping),
-            # "crosstalk": self._calculate_crosstalk(mapping, start_time, end_time)
+            "task_id": task_id, "mapping": mapping,
+            "start_time": start_time, "end_time": end_time
         })
-
-        # 更新芯片资源预定
         for physical_q_id in mapping.values():
             self.chip_model[physical_q_id].booking_schedule.append((start_time, end_time))
-            self.chip_model[physical_q_id].booking_schedule.sort()  # 保持排序
+            self.chip_model[physical_q_id].booking_schedule.sort()
 
-        # --- 3. 计算中间奖励 ---
+        # --- 3. 【全新】计算新的中间奖励 ---
         makespan_after = max(t['end_time'] for t in self.schedule_plan)
         makespan_increase = makespan_after - makespan_before
 
-        # 核心奖励塑造：惩罚makespan的增加量。
-        # 我们用负值，所以这是个惩罚。为了让数值更显著，可以乘以一个系数。
-        intermediate_reward = -makespan_increase / 1000.0  # e.g., 除以1000将单位从ns级转为更小的数
+        # a. 基础的Makespan增长惩罚 (仍然保留)
+        penalty_makespan = -makespan_increase / 1000.0
 
-        # --- 确定奖励和终止条件 ---
+        # b. 新的“紧凑度”奖励
+        reward_compaction = 0.0
+        # 任务占用的“时空体积”
+        task_volume = len(mapping) * duration
+        if makespan_increase > 0:
+            # 任务所引起的总时空增长体积
+            total_volume_increase = self.num_qubits * makespan_increase
+            # 利用率 = 任务实际占用的体积 / 它导致的总可用体积增长
+            utilization = task_volume / total_volume_increase if total_volume_increase > 0 else 0
+            # 奖励与利用率成正比
+            reward_compaction = utilization
+        else:
+            # 如果没有增加makespan，说明这是一个完美的“填空”，给予一个大的固定奖励！
+            reward_compaction = 2.0  # 这是一个超参数，可以调整
+
+        # c. 总中间奖励
+        # w_penalty 和 w_compaction 是新的超参数，需要调整
+        w_penalty = 0.5
+        w_compaction = 1.0
+        intermediate_reward = w_penalty * penalty_makespan + w_compaction * reward_compaction
+
+        # --- 4. 确定终止和最终奖励 ---
         terminated = (self.current_step == self.num_tasks)
         final_reward_bonus = 0.0
         if terminated:
             final_reward_bonus = self._calculate_final_reward()
 
-        # 总奖励 = 中间奖励 + 最终通关奖励 (只在最后一步非0)
         total_reward = intermediate_reward + final_reward_bonus
 
-        # --- 生成下一步观察 (Next Observation) ---
-        # 这个观察在我们的主循环中不会被直接用于决策，但需要保持API的完整性。
-        # 一个合理的做法是，返回下一个待调度任务的初始观察。
+        # ... (生成下一步观察) ...
+        # ... (返回结果) ...
         if not terminated:
-            # 如果还有任务，就准备下一个任务的观察
-            next_task_id = self.current_step
-            # 下一个任务的放置还未开始，所以 placement_in_progress 是空的
-            next_obs = self._get_obs(next_task_id, {})
+            next_obs = self._get_obs(self.current_step, {})
         else:
-            # 如果所有任务都完成了，就用最后一个任务的初始观察作为占位符
-            # 这里的观察内容不重要，因为 episode 已经结束
             last_task_id = self.num_tasks - 1
             next_obs = self._get_obs(last_task_id, {})
 
-        # Gymnasium API 返回 (obs, reward, terminated, truncated, info)
         return next_obs, total_reward, terminated, False, {}
 
     def _estimate_fidelity(self, task: QuantumTask, mapping: Dict) -> float:

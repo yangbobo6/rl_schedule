@@ -6,6 +6,8 @@ import numpy as np
 
 # --- 1. 导入自定义模块 ---
 from environment import QuantumSchedulingEnv
+from models.actor_critic import CNNActorCritic
+from models.gnn_encoder import GNNEncoder
 from models.quantum_task import QuantumTask  # 确保__init__.py工作正常
 from torch.utils.tensorboard import SummaryWriter # 导入TensorBoard的Writer
 import time
@@ -21,15 +23,19 @@ class Hyperparameters:
     # PPO 训练参数
     LEARNING_RATE = 5e-4
     ENTROPY_BETA = 0.02
-    GAMMA = 0.99  # 折扣因子
+    GAMMA = 0.98  # 折扣因子
     GAE_LAMBDA = 0.95  # GAE平滑参数
     PPO_EPSILON = 0.2  # PPO裁剪系数
-    CRITIC_DISCOUNT = 0.5  # Critic loss的系数
-    PPO_EPOCHS = 4  # 每次更新时，用同一批数据训练的次数
+    CRITIC_DISCOUNT = 0.75  # Critic loss的系数
+    PPO_EPOCHS = 15  # 每次更新时，用同一批数据训练的次数
     MINI_BATCH_SIZE = 64
     ROLLOUT_LENGTH = 2048  # 收集多少步经验后进行一次网络更新
     # 训练过程参数
     MAX_EPISODES = 1000
+    # GNN参数
+    GNN_NODE_DIM = 1
+    GNN_HIDDEN_DIM = 32
+    GNN_OUTPUT_DIM = 16  # 这将是我们的 graph_embedding 维度
 
 
 # --- 3. 定义Actor-Critic网络 ---
@@ -111,15 +117,38 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    # 【修改】1. 初始化GNN模型
+    gnn_model = GNNEncoder(
+        node_feature_dim=args.GNN_NODE_DIM,
+        hidden_dim=args.GNN_HIDDEN_DIM,
+        output_dim=args.GNN_OUTPUT_DIM
+    ).to(device)
+    gnn_model.eval()  # 我们只用它来编码，不训练
+
+    gate_times = {
+        'u3': 50, 'u': 50, 'p': 30, 'cx': 350, 'id': 30,
+        'measure': 1000, 'rz': 30, 'sx': 40, 'x': 40
+    }  # 扩展门集以适应更多线路
+
     env = QuantumSchedulingEnv(
         chip_size=args.CHIP_SIZE,
         num_tasks=args.NUM_TASKS,
-        max_qubits_per_task=args.MAX_QUBITS_PER_TASK
+        max_qubits_per_task=args.MAX_QUBITS_PER_TASK,
+        gnn_model=gnn_model,
+        device=device,
+        gate_times=gate_times
     )
 
-    action_space_dim = env.num_qubits  # 我们的动作是选择一个物理比特
-    model = ActorCritic(env.observation_space, action_space_dim).to(device)
+    # 【修改】3. 初始化新的Actor-Critic模型
+    action_space_dim = env.num_qubits
+    model = CNNActorCritic(env.observation_space, action_space_dim).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.LEARNING_RATE)
+    # 在optimizer后添加学习率调度器
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.9)  # 每200个epoch，学习率乘以0.9
+
+    # action_space_dim = env.num_qubits  # 我们的动作是选择一个物理比特
+    # model = ActorCritic(env.observation_space, action_space_dim).to(device)
+    # optimizer = optim.Adam(model.parameters(), lr=args.LEARNING_RATE)
 
     # PPO经验缓冲区
     rollout_buffer = {
@@ -192,7 +221,7 @@ def main():
 
                 # 5. 检查是否需要更新网络
                 if len(rollout_buffer["actions"]) >= args.ROLLOUT_LENGTH:
-                    update_ppo(model, optimizer, rollout_buffer, args, device, last_value=value)
+                    update_ppo(model, optimizer, rollout_buffer, args, device, value, writer, global_step)
                     # 清空缓冲区
                     for k in rollout_buffer: rollout_buffer[k] = []
 
@@ -243,18 +272,21 @@ def main():
         # writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
         # ...
         env.render()
+        scheduler.step()
 
     # 关闭writer
     writer.close()
     print("Training finished.")
 
-def update_ppo(model, optimizer, buffer, args, device, last_value):
-    """一个简化的PPO更新函数"""
+
+def update_ppo(model, optimizer, buffer, args, device, last_value, writer, global_step):
+    """
+    【已修改】一个PPO更新函数，增加了TensorBoard日志记录。
+    """
     # --- 计算优势 (GAE) ---
+    # ... (这部分代码保持不变) ...
     advantages = np.zeros(len(buffer["rewards"]), dtype=np.float32)
     last_gae_lam = 0
-
-    # 将last_value转换为numpy
     last_value_np = last_value.cpu().detach().numpy().flatten()
 
     for t in reversed(range(len(buffer["rewards"]))):
@@ -267,12 +299,10 @@ def update_ppo(model, optimizer, buffer, args, device, last_value):
 
         delta = buffer["rewards"][t] + args.GAMMA * next_values * next_non_terminal - buffer["values"][t]
         advantages[t] = last_gae_lam = delta + args.GAMMA * args.GAE_LAMBDA * next_non_terminal * last_gae_lam
-
     returns = advantages + np.array(buffer["values"]).flatten()
 
     # --- 转换为Tensor ---
-    obs_tensors = {k: torch.tensor(np.array([d[k] for d in buffer["obs"]]), dtype=torch.float32).to(device) for k in
-                   buffer["obs"][0]}
+    obs_tensors = {k: torch.tensor(np.array([d[k] for d in buffer["obs"]]), dtype=torch.float32).to(device) for k in buffer["obs"][0]}
     actions_t = torch.tensor(buffer["actions"]).flatten().to(device)
     log_probs_old_t = torch.tensor(buffer["log_probs"]).flatten().to(device)
     advantages_t = torch.tensor(advantages).flatten().to(device)
@@ -280,42 +310,45 @@ def update_ppo(model, optimizer, buffer, args, device, last_value):
 
     # --- 多轮次小批量更新 ---
     indices = np.arange(len(buffer["rewards"]))
-    for _ in range(args.PPO_EPOCHS):
+    for i in range(args.PPO_EPOCHS): # i 是 PPO epoch 的索引
         np.random.shuffle(indices)
         for start in range(0, len(buffer["rewards"]), args.MINI_BATCH_SIZE):
             end = start + args.MINI_BATCH_SIZE
             batch_indices = indices[start:end]
 
-            # 提取小批量数据
+            # ... (提取小批量数据) ...
             batch_obs = {k: v[batch_indices] for k, v in obs_tensors.items()}
             batch_actions = actions_t[batch_indices]
             batch_log_probs_old = log_probs_old_t[batch_indices]
             batch_advantages = advantages_t[batch_indices]
             batch_returns = returns_t[batch_indices]
 
-            # 重新计算新策略下的值
             logits, new_values = model(batch_obs)
             new_probs = Categorical(logits=logits)
             new_log_probs = new_probs.log_prob(batch_actions)
             entropy = new_probs.entropy()
 
-            # 计算Actor Loss
+            # --- 计算Loss ---
             ratio = torch.exp(new_log_probs - batch_log_probs_old)
             surr1 = ratio * batch_advantages
             surr2 = torch.clamp(ratio, 1 - args.PPO_EPSILON, 1 + args.PPO_EPSILON) * batch_advantages
             actor_loss = -torch.min(surr1, surr2).mean()
-
-            # 计算Critic Loss
             critic_loss = nn.MSELoss()(new_values.squeeze(), batch_returns)
+            entropy_value = entropy.mean()
+            loss = actor_loss + args.CRITIC_DISCOUNT * critic_loss - args.ENTROPY_BETA * entropy_value
 
-            # 计算总Loss
-            loss = actor_loss + args.CRITIC_DISCOUNT * critic_loss - args.ENTROPY_BETA * entropy.mean()
-
-            # 更新
+            # --- 更新 ---
             optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # 梯度裁剪
+            nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
+
+    # --- 【核心修改】在所有PPO Epochs结束后记录一次最终的Loss值 ---
+    # 这样可以避免图表过于密集，我们只关心每个Rollout更新后的最终状态
+    writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
+    writer.add_scalar("losses/critic_loss", critic_loss.item(), global_step)
+    writer.add_scalar("losses/entropy", entropy_value.item(), global_step)
+    writer.add_scalar("losses/total_loss", loss.item(), global_step)
 
 
 if __name__ == "__main__":

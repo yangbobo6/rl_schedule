@@ -1,10 +1,11 @@
 import networkx as nx
+import numpy as np
 
 class QuantumTask:
     """代表一个量子线路任务"""
 
     def __init__(self, task_id: int, num_qubits: int, depth: int, shots: int,
-                 interaction_graph: nx.Graph, estimated_duration: float):
+                 interaction_graph: nx.Graph, estimated_duration: float,graph_embedding: np.ndarray):
         self.id = task_id
         self.is_scheduled = False
         self.num_qubits = num_qubits
@@ -12,6 +13,7 @@ class QuantumTask:
         self.shots = shots
         self.interaction_graph = interaction_graph
         self.estimated_duration = estimated_duration
+        self.graph_embedding = graph_embedding
 
     def _generate_random_graph(self) -> nx.Graph:
         # 这是一个占位符，您需要用MQBench生成的线路来构建真实的交互图
