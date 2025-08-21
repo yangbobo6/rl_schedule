@@ -6,7 +6,7 @@ import numpy as np
 
 # --- 1. 导入自定义模块 ---
 from environment import QuantumSchedulingEnv
-from models.actor_critic import CNNActorCritic
+from models.actor_critic import CNNActorCritic, TransformerActorCritic
 from models.gnn_encoder import GNNEncoder
 from models.quantum_task import QuantumTask  # 确保__init__.py工作正常
 from torch.utils.tensorboard import SummaryWriter # 导入TensorBoard的Writer
@@ -21,21 +21,25 @@ class Hyperparameters:
     NUM_TASKS = 10
     MAX_QUBITS_PER_TASK = 6
     # PPO 训练参数
-    LEARNING_RATE = 5e-4
-    ENTROPY_BETA = 0.02
+    LEARNING_RATE = 1e-4
+    ENTROPY_BETA = 0.01
     GAMMA = 0.98  # 折扣因子
     GAE_LAMBDA = 0.95  # GAE平滑参数
     PPO_EPSILON = 0.2  # PPO裁剪系数
     CRITIC_DISCOUNT = 0.75  # Critic loss的系数
-    PPO_EPOCHS = 15  # 每次更新时，用同一批数据训练的次数
+    PPO_EPOCHS = 10  # 每次更新时，用同一批数据训练的次数
     MINI_BATCH_SIZE = 64
-    ROLLOUT_LENGTH = 2048  # 收集多少步经验后进行一次网络更新
+    ROLLOUT_LENGTH = 4096  # 收集多少步经验后进行一次网络更新
     # 训练过程参数
     MAX_EPISODES = 1000
     # GNN参数
     GNN_NODE_DIM = 1
     GNN_HIDDEN_DIM = 32
     GNN_OUTPUT_DIM = 16  # 这将是我们的 graph_embedding 维度
+    # Transformer模型参数
+    D_MODEL = 128  # Transformer的隐藏维度
+    N_HEAD = 4  # 注意力头的数量
+    NUM_ENCODER_LAYERS = 3  # Encoder层数
 
 
 # --- 3. 定义Actor-Critic网络 ---
@@ -141,7 +145,14 @@ def main():
 
     # 【修改】3. 初始化新的Actor-Critic模型
     action_space_dim = env.num_qubits
-    model = CNNActorCritic(env.observation_space, action_space_dim).to(device)
+    # model = CNNActorCritic(env.observation_space, action_space_dim).to(device)
+    model = TransformerActorCritic(
+        obs_space=env.observation_space,
+        action_space_dim=action_space_dim,
+        d_model=args.D_MODEL,
+        nhead=args.N_HEAD,
+        num_encoder_layers=args.NUM_ENCODER_LAYERS
+    ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.LEARNING_RATE)
     # 在optimizer后添加学习率调度器
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.9)  # 每200个epoch，学习率乘以0.9
