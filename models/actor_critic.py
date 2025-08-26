@@ -140,15 +140,15 @@ class TransformerActorCritic(nn.Module):
     def forward(self, obs: dict) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size = obs["qubit_embeddings"].shape[0]
 
-        # a. 将各个输入部分进行嵌入
+        # a. 将所有不同来源、不同维度的特征，通过线性层（nn.Linear）统一映射到 Transformer 能理解的维度 d_model (128)。
         qubit_embeds = self.qubit_embed(obs["qubit_embeddings"])  # (B, NumQubits, D_model)
         task_embed = self.task_embed(obs["current_task_embedding"]).unsqueeze(1)  # (B, 1, D_model)
         context_embed = self.context_embed(obs["logical_qubit_context"]).unsqueeze(1)  # (B, 1, D_model)
 
         # b. 构建完整的输入序列
         # [CLS], [TASK], [CONTEXT], [QUBIT_1], ..., [QUBIT_25]
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1) # shape: (B, 1, 128)
+        # 拼接
         full_sequence = torch.cat([
             cls_tokens,
             task_embed,
@@ -156,7 +156,7 @@ class TransformerActorCritic(nn.Module):
             qubit_embeds
         ], dim=1)
 
-        # c. 通过Transformer Encoder
+        # c. 通过Transformer Encoder  输入 shape: (B, 28, 128)
         # 注意：我们需要一个padding mask来告诉Transformer忽略哪些部分，但在这个固定长度输入的场景下可以简化
         encoded_sequence = self.transformer_encoder(full_sequence)
 
@@ -166,10 +166,10 @@ class TransformerActorCritic(nn.Module):
         mlp_output = self.shared_mlp(global_features)  # (B, 128)
 
         # 芯片特征来自所有比特的输出
-        qubit_features = encoded_sequence[:, 3:].flatten(start_dim=1)  # (B, NumQubits * D_model)
+        qubit_features = encoded_sequence[:, 3:].flatten(start_dim=1)  # (B, NumQubits * D_model) (B, 3200)
 
         # e. 通过输出头
-        # Actor的决策依赖于全局情况和芯片的具体情况
+        # Actor的决策依赖于 全局情况和芯片 的具体情况
         actor_input = torch.cat([mlp_output, qubit_features], dim=1)
         action_logits = self.actor_head(actor_input)
 

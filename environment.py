@@ -131,7 +131,7 @@ class QuantumSchedulingEnv(gym.Env):
 
     def _get_obs(self, current_task_id: int, placement_in_progress: Dict[int, Tuple[int, int]]) -> Dict:
         """
-        【已修正】生成一个简化的、聚焦于时间和空间布局的观察。
+        生成一个简化的、聚焦于时间和空间布局的观察。
         确保 task_embedding 的构建与 observation_space 的定义一致。
         """
         # --- 1. 芯片状态嵌入 (Qubit Embeddings) ---
@@ -148,6 +148,7 @@ class QuantumSchedulingEnv(gym.Env):
             x_norm = qubit.id[0] / (self.chip_size[0] - 1)
             y_norm = qubit.id[1] / (self.chip_size[1] - 1)
             next_avail_time_norm = qubit.get_next_available_time() / max_current_time
+            # 简化，只提供了坐标和时间信息，暂时去掉了保真度以及串扰
             qubit_embeddings[idx] = [x_norm, y_norm, next_avail_time_norm]
 
         # --- 2. 当前任务嵌入 (Current Task Embedding) ---
@@ -160,11 +161,9 @@ class QuantumSchedulingEnv(gym.Env):
         scalar_features = np.array([num_q_norm, duration_norm], dtype=np.float32)
 
         # b. 从任务对象中获取预计算好的GNN嵌入
-        # 【核心修正】
         graph_embedding = task.graph_embedding
 
         # c. 将标量特征和GNN嵌入拼接起来
-        # 【核心修正】
         task_embedding = np.concatenate([scalar_features, graph_embedding])
 
         # --- 3. 放置掩码 (Placement Mask) ---
@@ -181,9 +180,11 @@ class QuantumSchedulingEnv(gym.Env):
             graph = task.interaction_graph
             for placed_logical_idx in placement_in_progress.keys():
                 if graph.has_edge(current_logical_idx, placed_logical_idx):
+                    # 本次调度的逻辑比特和已经调度的比特连接性
                     connectivity_to_placed += 1
 
         logical_qubit_context = np.array([
+            # 当前逻辑比特在任务中的索引
             current_logical_idx / self.max_qubits_per_task,
             connectivity_to_placed / self.max_qubits_per_task
         ], dtype=np.float32)
@@ -197,7 +198,7 @@ class QuantumSchedulingEnv(gym.Env):
 
     def reset(self, seed=None, options=None) -> Tuple[Dict, Dict]:
         """
-        【已修改】重置环境到初始状态，并为第一个任务生成一个合法的初始观察。
+        重置环境到初始状态，并为第一个任务生成一个合法的初始观察。
         """
         super().reset(seed=seed)
 
@@ -222,73 +223,76 @@ class QuantumSchedulingEnv(gym.Env):
 
         return initial_obs, {}
 
+    def _calculate_idle_volume(self, schedule: list, makespan: float) -> float:
+        """辅助函数，计算当前调度方案的空闲时空体积"""
+        if not schedule:
+            return 0.0
+
+        occupied_volume = sum(
+            len(item['mapping']) * (item['end_time'] - item['start_time'])
+            for item in schedule
+        )
+        total_volume = self.num_qubits * makespan
+        return total_volume - occupied_volume
+
     def step(self, action: Dict[str, Any]) -> Tuple[Dict, float, bool, bool, Dict]:
         """
-        引入了基于芯片利用率的“紧凑度”奖励。
+        使用“紧凑度”奖励函数。
         """
         # --- 1. 记录执行动作前的状态 ---
         makespan_before = 0
         if self.schedule_plan:
             makespan_before = max(t['end_time'] for t in self.schedule_plan)
-
-        task_id = action["task_id"]
-        mapping = action["mapping"]
-        start_time = action["start_time"]
-        task = self.task_pool[task_id]
+        idle_volume_before = self._calculate_idle_volume(self.schedule_plan, makespan_before)
 
         # --- 2. 正常执行动作 ---
+        task_id = action["task_id"]
+        # ... (与之前相同的动作执行代码) ...
+        task = self.task_pool[task_id]
         task.is_scheduled = True
         self.current_step += 1
         duration = task.estimated_duration
-        end_time = start_time + duration
+        end_time = action["start_time"] + duration
 
-        # ... (更新 schedule_plan 和 chip_model) ...
-        self.schedule_plan.append({
-            "task_id": task_id, "mapping": mapping,
-            "start_time": start_time, "end_time": end_time
-        })
-        for physical_q_id in mapping.values():
-            self.chip_model[physical_q_id].booking_schedule.append((start_time, end_time))
-            self.chip_model[physical_q_id].booking_schedule.sort()
+        # 创建一个临时的、更新后的调度计划来计算新状态
+        next_schedule_plan = self.schedule_plan + [{
+            "task_id": task_id, "mapping": action["mapping"],
+            "start_time": action["start_time"], "end_time": end_time
+        }]
 
         # --- 3. 【全新】计算新的中间奖励 ---
-        makespan_after = max(t['end_time'] for t in self.schedule_plan)
-        makespan_increase = makespan_after - makespan_before
+        makespan_after = max(t['end_time'] for t in next_schedule_plan)
+        idle_volume_after = self._calculate_idle_volume(next_schedule_plan, makespan_after)
 
-        # a. 基础的Makespan增长惩罚 (仍然保留)
-        penalty_makespan = -makespan_increase / 1000.0
+        task_volume = len(action["mapping"]) * duration
 
-        # b. 新的“紧凑度”奖励
-        reward_compaction = 0.0
-        # 任务占用的“时空体积”
-        task_volume = len(mapping) * duration
-        if makespan_increase > 0:
-            # 任务所引起的总时空增长体积
-            total_volume_increase = self.num_qubits * makespan_increase
-            # 利用率 = 任务实际占用的体积 / 它导致的总可用体积增长
-            utilization = task_volume / total_volume_increase if total_volume_increase > 0 else 0
-            # 奖励与利用率成正比
-            reward_compaction = utilization
-        else:
-            # 如果没有增加makespan，说明这是一个完美的“填空”，给予一个大的固定奖励！
-            reward_compaction = 2.0  # 这是一个超参数，可以调整
+        # 净空闲体积减少量 = (旧空闲) - (新空闲)
+        idle_volume_reduction = idle_volume_before - idle_volume_after
 
-        # c. 总中间奖励
-        # w_penalty 和 w_compaction 是新的超参数，需要调整
-        w_penalty = 0.5
-        w_compaction = 1.0
-        intermediate_reward = w_penalty * penalty_makespan + w_compaction * reward_compaction
+        # 核心奖励公式：紧凑度得分
+        # 这个得分衡量了每单位任务体积能带来多大的净空闲体积减少
+        # 它是无界的，但可以用tanh将其映射到一个好的范围[-1, 1]
+        compaction_score = (idle_volume_reduction / task_volume) if task_volume > 0 else 0.0
 
-        # --- 4. 确定终止和最终奖励 ---
+        # 使用tanh函数将得分映射到(-1, 1)，这是一个很好的归一化技巧
+        intermediate_reward = np.tanh(compaction_score)
+
+        # --- 4. 更新真实的环境状态 ---
+        self.schedule_plan = next_schedule_plan
+        for physical_q_id in action["mapping"].values():
+            self.chip_model[physical_q_id].booking_schedule.append((action["start_time"], end_time))
+            self.chip_model[physical_q_id].booking_schedule.sort()
+
+        # --- 5. 确定终止和最终奖励 ---
         terminated = (self.current_step == self.num_tasks)
         final_reward_bonus = 0.0
         if terminated:
+            # 最终奖励保持不变，作为对最终makespan的评价
             final_reward_bonus = self._calculate_final_reward()
 
         total_reward = intermediate_reward + final_reward_bonus
 
-        # ... (生成下一步观察) ...
-        # ... (返回结果) ...
+        # ... (生成下一步观察并返回) ...
         if not terminated:
             next_obs = self._get_obs(self.current_step, {})
         else:
