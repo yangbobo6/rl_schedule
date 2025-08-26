@@ -16,30 +16,34 @@ from visualizer import plot_schedule # 导入我们的绘图函数
 
 # --- 2. 定义超参数 ---
 class Hyperparameters:
-    # 环境参数
-    CHIP_SIZE = (5, 5)
-    NUM_TASKS = 10
-    MAX_QUBITS_PER_TASK = 6
-    # PPO 训练参数
-    LEARNING_RATE = 1e-4
-    ENTROPY_BETA = 0.01
-    GAMMA = 0.98  # 折扣因子
-    GAE_LAMBDA = 0.95  # GAE平滑参数
-    PPO_EPSILON = 0.2  # PPO裁剪系数
-    CRITIC_DISCOUNT = 0.75  # Critic loss的系数
-    PPO_EPOCHS = 10  # 每次更新时，用同一批数据训练的次数
-    MINI_BATCH_SIZE = 64
-    ROLLOUT_LENGTH = 4096  # 收集多少步经验后进行一次网络更新
-    # 训练过程参数
-    MAX_EPISODES = 1000
-    # GNN参数
+    # --- 训练过程参数 ---
+    MAX_EPISODES = 20000  # 增加训练总轮数
+
+    # --- 环境参数 ---
+    CHIP_SIZE = (6, 6)  # 挑战更大的芯片
+    NUM_TASKS = 20  # 挑战更多的任务
+    MAX_QUBITS_PER_TASK = 8  # 相应增加
+
+    # --- PPO 训练参数 ---
+    LEARNING_RATE = 1e-4  # Transformer的稳定学习率
+    GAMMA = 0.99
+    GAE_LAMBDA = 0.95
+    PPO_EPSILON = 0.2
+    CRITIC_DISCOUNT = 0.75  # 保持较高的Critic权重
+    ENTROPY_BETA = 0.01  # 可以从一个稍小的值开始，防止在长训练中过早停止探索
+    PPO_EPOCHS = 15  # 保持较高的PPO Epochs
+    ROLLOUT_LENGTH = 8192  # 充分利用GPU和内存，收集高质量数据
+    MINI_BATCH_SIZE = 512  # 使用更大的批次以获得更稳定的梯度
+
+    # --- GNN参数 ---
     GNN_NODE_DIM = 1
     GNN_HIDDEN_DIM = 32
-    GNN_OUTPUT_DIM = 16  # 这将是我们的 graph_embedding 维度
-    # Transformer模型参数
-    D_MODEL = 128  # Transformer的隐藏维度
-    N_HEAD = 4  # 注意力头的数量
-    NUM_ENCODER_LAYERS = 3  # Encoder层数
+    GNN_OUTPUT_DIM = 16
+
+    # --- Transformer模型参数 ---
+    D_MODEL = 128
+    N_HEAD = 4
+    NUM_ENCODER_LAYERS = 3
 
 
 # --- 3. 定义Actor-Critic网络 ---
@@ -109,6 +113,12 @@ def main():
     os.makedirs(plots_dir, exist_ok=True)  # exist_ok=True 避免目录已存在时报错
     print(f"Results will be saved in: {run_dir}")
 
+    # 创建用于保存模型权重的目录
+    checkpoints_dir = f"{run_dir}/checkpoints"
+    os.makedirs(plots_dir, exist_ok=True)
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    print(f"Results will be saved in: {run_dir}")
+
     # --- TensorBoard 初始化 ---
     run_name = f"QuantumScheduler__{int(time.time())}"
     writer = SummaryWriter(tensorboard_log_dir)
@@ -154,8 +164,9 @@ def main():
         num_encoder_layers=args.NUM_ENCODER_LAYERS
     ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.LEARNING_RATE)
-    # 在optimizer后添加学习率调度器
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.9)  # 每200个epoch，学习率乘以0.9
+    # 引入学习率衰减，适用于长时间训练
+    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.1,
+                                                  total_iters=args.MAX_EPISODES)
 
     # action_space_dim = env.num_qubits  # 我们的动作是选择一个物理比特
     # model = ActorCritic(env.observation_space, action_space_dim).to(device)
