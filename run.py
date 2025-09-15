@@ -131,7 +131,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # 【修改】1. 初始化GNN模型
+    # 1. 初始化GNN模型
     gnn_model = GNNEncoder(
         node_feature_dim=args.GNN_NODE_DIM,
         hidden_dim=args.GNN_HIDDEN_DIM,
@@ -153,7 +153,28 @@ def main():
         gate_times=gate_times
     )
 
-    # 【修改】3. 初始化新的Actor-Critic模型
+    # --- 保存芯片可视化图表 ---
+    print("Generating and saving chip visualizations...")
+    chip_viz_dir = f"{run_dir}/chip_visualization"
+    os.makedirs(chip_viz_dir, exist_ok=True)
+    
+    # 保存芯片总览图
+    chip_overview_path = f"{chip_viz_dir}/chip_overview.png"
+    env.visualize_chip(chip_overview_path, show_values=True)
+    
+    # 保存连接矩阵
+    connectivity_path = f"{chip_viz_dir}/connectivity_matrix.png"
+    env.visualize_connectivity(connectivity_path)
+    
+    # 导出芯片统计信息
+    stats_path = f"{chip_viz_dir}/chip_stats.json"
+    chip_stats = env.export_chip_stats(stats_path)
+    
+    print(f"Chip visualizations saved to: {chip_viz_dir}")
+    print(f"Chip stats: T1={chip_stats['avg_t1']:.2f}μs, T2={chip_stats['avg_t2']:.2f}μs, "
+          f"Fidelity_1Q={chip_stats['avg_fidelity_1q']:.4f}")
+
+    # 3. 初始化新的Actor-Critic模型
     action_space_dim = env.num_qubits
     # model = CNNActorCritic(env.observation_space, action_space_dim).to(device)
     model = TransformerActorCritic(
@@ -239,7 +260,7 @@ def main():
 
                 # 4. 更新进行中的放置
                 physical_qubit_id = env.idx_to_qubit_id[action.item()]  # 将action的下表（例如2）转换为qubit_id 例如(2,3)
-                placement_in_progress[i] = physical_qubit_id
+                placement_in_progress[i] = physical_qubit_id #dict (0:(2,3), 1:(2,4), 2:(3,3), 3:(3,4))
 
                 # 5. 检查是否需要更新网络
                 if len(rollout_buffer["actions"]) >= args.ROLLOUT_LENGTH:
@@ -260,7 +281,7 @@ def main():
             # --- 将宏观步骤的奖励分配给微观步骤 ---
             # 这是关键一步：我们将刚刚收到的中间奖励，
             # 平均分配或者全部归功于导致它的最后一个微观动作。
-            # 将其归功于最后一个微观动作更简单且常用。
+            # 将其归功于最后一个微观动作更简单且常用。  (中间的映射比特没有奖励，只是防止完一个任务才会有奖励)
             if rollout_buffer["rewards"]:
                 rollout_buffer["rewards"][-1] += reward
 
@@ -303,10 +324,9 @@ def main():
 
 def update_ppo(model, optimizer, buffer, args, device, last_value, writer, global_step):
     """
-    【已修改】一个PPO更新函数，增加了TensorBoard日志记录。
+    一个PPO更新函数，增加了TensorBoard日志记录。
     """
-    # --- 计算优势 (GAE) ---
-    # ... (这部分代码保持不变) ...
+    # --- 计算优势 (GAE) ---  A_t 告诉我们在状态s_t下，采取动作a_t比平均水平好多少。V_target_t是Critic网络应该学习的目标。
     advantages = np.zeros(len(buffer["rewards"]), dtype=np.float32)
     last_gae_lam = 0
     last_value_np = last_value.cpu().detach().numpy().flatten()
@@ -341,19 +361,32 @@ def update_ppo(model, optimizer, buffer, args, device, last_value, writer, globa
             # ... (提取小批量数据) ...
             batch_obs = {k: v[batch_indices] for k, v in obs_tensors.items()}
             batch_actions = actions_t[batch_indices]
+            # 收集数据时，旧策略对所选动作的打分
             batch_log_probs_old = log_probs_old_t[batch_indices]
             batch_advantages = advantages_t[batch_indices]
+            # 我们在第一部分计算出的 “正确答案” （实际价值目标）。
             batch_returns = returns_t[batch_indices]
 
+            # new_values: Critic网络对于小批量数据中的状态，做出的新预测。
             logits, new_values = model(batch_obs)
             new_probs = Categorical(logits=logits)
+            # 更新网络时，新策略对同一个动作的打分
             new_log_probs = new_probs.log_prob(batch_actions)
             entropy = new_probs.entropy()
 
             # --- 计算Loss ---
+            # 概率比率 衡量了新策略相对于旧策略，有多么“倾向于”做出我们当时实际做出的那个动作 a，ratio > 1: 新策略更喜欢这个动作
             ratio = torch.exp(new_log_probs - batch_log_probs_old)
+            # 传统的策略梯度目标
+            # 如果advantage > 0（好动作），我们就想提高ratio（即提高选择这个动作的概率），从而最大化这个目标。
             surr1 = ratio * batch_advantages
+            # PPO的“安全带”,clamp(ratio, 1 - ε, 1 + ε): 我们将ratio强制限制在一个很小的区间内，例如[0.8, 1.2]
+            # 如果advantage > 0（好动作），我们鼓励ratio变大，但最大只能到1.2。我们不允许新策略因为一个好动作就变得过于“激动”，更新幅度被限制了。
             surr2 = torch.clamp(ratio, 1 - args.PPO_EPSILON, 1 + args.PPO_EPSILON) * batch_advantages
+            # 取这两个目标中更悲观（更小）的那个
+            # 当advantage > 0时，surr2限制了更新的上限。
+            # 当advantage < 0时，surr1可能比surr2更小，这意味着如果ratio变得过大（新策略突然极度不喜欢一个坏动作），我们允许一次幅度更大的更新。
+            # 最后的负号，是因为优化器是最小化loss，而我们的目标是最大化策略表现。
             actor_loss = -torch.min(surr1, surr2).mean()
             critic_loss = nn.MSELoss()(new_values.squeeze(), batch_returns)
             entropy_value = entropy.mean()
@@ -365,7 +398,7 @@ def update_ppo(model, optimizer, buffer, args, device, last_value, writer, globa
             nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
 
-    # --- 【核心修改】在所有PPO Epochs结束后记录一次最终的Loss值 ---
+    # --- 在所有PPO Epochs结束后记录一次最终的Loss值 ---
     # 这样可以避免图表过于密集，我们只关心每个Rollout更新后的最终状态
     writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
     writer.add_scalar("losses/critic_loss", critic_loss.item(), global_step)

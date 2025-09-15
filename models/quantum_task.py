@@ -1,5 +1,6 @@
 import networkx as nx
 import numpy as np
+import matplotlib.pyplot as plt
 
 class QuantumTask:
     """代表一个量子线路任务"""
@@ -15,9 +16,16 @@ class QuantumTask:
         self.estimated_duration = estimated_duration
         self.graph_embedding = graph_embedding
 
+    # 暂时没用到
     def _generate_random_graph(self) -> nx.Graph:
         # 这是一个占位符，您需要用MQBench生成的线路来构建真实的交互图
         g = nx.gnp_random_graph(self.num_qubits, 0.6)
+        plt.figure()  # 创建一个新画布，这是一个好习惯
+        nx.draw(g, with_labels=True, node_color='skyblue', edge_color='gray')
+        # 构建一个唯一的文件名，避免文件被覆盖
+        filename = f"interaction_graph_task_{11111}.png"
+        plt.savefig(filename)  # 将当前画布上的图像保存到文件
+        plt.close()  # 关闭画布，释放内存，防止后续绘图混在一起
         return g
 
     def _estimate_duration(self) -> float:

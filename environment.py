@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Tuple
 from models.physical_qubit import PhysicalQubit
 from models.quantum_task import QuantumTask
 from task_generate import TaskGenerator
+from chip_visualizer import QuantumChipVisualizer
 
 
 class QuantumSchedulingEnv(gym.Env):
@@ -15,7 +16,7 @@ class QuantumSchedulingEnv(gym.Env):
     """
     metadata = {'render_modes': ['human']}
 
-    def __init__(self, chip_size: Tuple[int, int] , num_tasks: int,
+    def __init__(self, chip_size: Tuple[int, int], num_tasks: int,
                  max_qubits_per_task: int, gnn_model, device, gate_times: Dict[str, float]
                  ):
         super().__init__()
@@ -24,7 +25,6 @@ class QuantumSchedulingEnv(gym.Env):
         self.num_qubits = chip_size[0] * chip_size[1]
         self.num_tasks = num_tasks
         self.max_qubits_per_task = max_qubits_per_task  # 用于定义观察空间
-
 
         # --- GNN编码器 (用于将任务交互图编码为向量) ---
         # 在实际项目中，这会是一个预训练或端到端训练的PyTorch/TensorFlow模型
@@ -37,6 +37,9 @@ class QuantumSchedulingEnv(gym.Env):
         self.task_pool: Dict[int, QuantumTask] = self._create_task_pool()
         self.schedule_plan: List[Dict] = []
         self.current_step = 0
+        
+        # --- 可视化工具 ---
+        self.visualizer = QuantumChipVisualizer(self.chip_model, self.chip_size)
 
         # 观察空间的定义现在依赖于gnn_model的输出维度
         gnn_output_dim = gnn_model.conv2.out_channels
@@ -59,7 +62,7 @@ class QuantumSchedulingEnv(gym.Env):
             # 映射和时间非常复杂，这里先不定义，在step中直接接收
         })
 
-        # --- 【修改处】定义简化的、聚焦时间的观察空间 ---
+        # --- 定义简化的、聚焦时间的观察空间 ---
         # 芯片嵌入维度: x, y (位置), next_avail_time (时间) -> Total 3
         D_QUBIT = 3
         # 任务标量维度: num_qubits (空间需求), estimated_duration (时间需求)
@@ -113,16 +116,18 @@ class QuantumSchedulingEnv(gym.Env):
         return chip
 
     def _create_task_pool(self) -> Dict[int, QuantumTask]:
-        """使用TaskGenerator创建任务池"""
-        print(f"Generating {self.num_tasks} tasks using TaskGenerator...")
-        return self.task_generator.generate_tasks(self.num_tasks)
+        """使用TaskGenerator从large_task_pool中采样创建任务池"""
+        print(f"Sampling {self.num_tasks} tasks from TaskGenerator's large_task_pool...")
+        return self.task_generator.get_episode_tasks(self.num_tasks)
 
     def _precompute_normalization_factors(self):
-        """【修改处】只预计算需要的因子"""
+        """只预计算需要的因子"""
         self.norm_factors = {}
         # 任务属性
-        self.norm_factors['max_task_qubits'] = max(t.num_qubits for t in self.task_pool.values()) if self.task_pool else self.max_qubits_per_task
-        self.norm_factors['max_task_duration'] = max(t.estimated_duration for t in self.task_pool.values()) if self.task_pool else 1.0
+        self.norm_factors['max_task_qubits'] = max(
+            t.num_qubits for t in self.task_pool.values()) if self.task_pool else self.max_qubits_per_task
+        self.norm_factors['max_task_duration'] = max(
+            t.estimated_duration for t in self.task_pool.values()) if self.task_pool else 1.0
 
     def _normalize(self, value, min_val, max_val):
         """将值归一化到[-1, 1]范围"""
@@ -345,3 +350,22 @@ class QuantumSchedulingEnv(gym.Env):
             print("===========================\n")
         else:
             raise NotImplementedError(f"Render mode {mode} not implemented.")
+    
+    def visualize_chip(self, save_path: str = None, show_values: bool = True):
+        """可视化量子芯片的物理属性和连接性"""
+        self.visualizer.visualize_chip_overview(save_path, show_values)
+    
+    def visualize_scheduling_state(self, save_path: str = None):
+        """可视化当前调度状态"""
+        current_time = 0
+        if self.schedule_plan:
+            current_time = max(t['end_time'] for t in self.schedule_plan)
+        self.visualizer.visualize_scheduling_state(self.schedule_plan, current_time, save_path)
+    
+    def visualize_connectivity(self, save_path: str = None):
+        """可视化芯片连接矩阵"""
+        self.visualizer.visualize_connectivity_matrix(save_path)
+    
+    def export_chip_stats(self, save_path: str = None):
+        """导出芯片统计信息"""
+        return self.visualizer.export_chip_stats(save_path)
