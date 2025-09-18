@@ -17,7 +17,7 @@ class QuantumSchedulingEnv(gym.Env):
     metadata = {'render_modes': ['human']}
 
     def __init__(self, chip_size: Tuple[int, int], num_tasks: int,
-                 max_qubits_per_task: int, gnn_model, device, gate_times: Dict[str, float]
+                 max_qubits_per_task: int, gnn_model, device, gate_times: Dict[str, float], reward_weights: Dict[str, float]
                  ):
         super().__init__()
 
@@ -25,6 +25,7 @@ class QuantumSchedulingEnv(gym.Env):
         self.num_qubits = chip_size[0] * chip_size[1]
         self.num_tasks = num_tasks
         self.max_qubits_per_task = max_qubits_per_task  # 用于定义观察空间
+        self.reward_weights = reward_weights
 
         # --- GNN编码器 (用于将任务交互图编码为向量) ---
         # 在实际项目中，这会是一个预训练或端到端训练的PyTorch/TensorFlow模型
@@ -37,6 +38,8 @@ class QuantumSchedulingEnv(gym.Env):
         self.task_pool: Dict[int, QuantumTask] = self._create_task_pool()
         self.schedule_plan: List[Dict] = []
         self.current_step = 0
+        # 简化版SWAP估算器：假设每个SWAP门增加固定的时间和错误
+        self.swap_penalty = {"duration": 3 * 350, "error": 0.03}  # 3个CX门
         
         # --- 可视化工具 ---
         self.visualizer = QuantumChipVisualizer(self.chip_model, self.chip_size)
@@ -62,9 +65,12 @@ class QuantumSchedulingEnv(gym.Env):
             # 映射和时间非常复杂，这里先不定义，在step中直接接收
         })
 
-        # --- 定义简化的、聚焦时间的观察空间 ---
-        # 芯片嵌入维度: x, y (位置), next_avail_time (时间) -> Total 3
-        D_QUBIT = 3
+        # --- 观察空间需要包含所有物理细节 ---
+        # 芯片嵌入维度: x, y, next_avail_time (3)
+        #             + f_1q, f_ro (2)
+        #             + 4 * (f_2q) for neighbors (4) -> Total 9
+        # (暂时不在状态中直接编码串扰，而是通过奖励让模型隐式学习)
+        D_QUBIT = 9
         # 任务标量维度: num_qubits (空间需求), estimated_duration (时间需求)
         D_TASK_SCALAR = 2
         # 我们仍然保留图的连接性信息，因为它对放置（空间布局）至关重要
@@ -129,6 +135,14 @@ class QuantumSchedulingEnv(gym.Env):
         self.norm_factors['max_task_duration'] = max(
             t.estimated_duration for t in self.task_pool.values()) if self.task_pool else 1.0
 
+        self.norm_factors['min_f1q'] = min(q.fidelity_1q for q in self.chip_model.values())
+        self.norm_factors['max_f1q'] = max(q.fidelity_1q for q in self.chip_model.values())
+
+        self.norm_factors['min_fro'] = 0.95
+        self.norm_factors['max_fro'] = 1.0
+        self.norm_factors['min_f2q'] = 0.95
+        self.norm_factors['max_f2q'] = 1.0
+
     def _normalize(self, value, min_val, max_val):
         """将值归一化到[-1, 1]范围"""
         if max_val == min_val: return 0.0
@@ -149,12 +163,28 @@ class QuantumSchedulingEnv(gym.Env):
                 max_current_time = makespan_so_far
 
         for q_id, qubit in self.chip_model.items():
+            # a. 空间 & 时间
             idx = self.qubit_id_to_idx[q_id]
             x_norm = qubit.id[0] / (self.chip_size[0] - 1)
             y_norm = qubit.id[1] / (self.chip_size[1] - 1)
             next_avail_time_norm = qubit.get_next_available_time() / max_current_time
-            # 简化，只提供了坐标和时间信息，暂时去掉了保真度以及串扰
-            qubit_embeddings[idx] = [x_norm, y_norm, next_avail_time_norm]
+
+            # b. 保真度特征
+            f_1q_norm = self._normalize(qubit.fidelity_1q, self.norm_factors['min_f1q'], self.norm_factors['max_f1q'])
+            f_ro_norm = self._normalize(qubit.fidelity_readout, self.norm_factors['min_fro'], self.norm_factors['max_fro'])  # 假设范围
+            qubit_features = [x_norm, y_norm, next_avail_time_norm, f_1q_norm, f_ro_norm]
+
+            # c. 邻居2Q门保真度 (用于学习连通性)
+            for neighbor_dir in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
+                neighbor_id = (qubit.id[0] + neighbor_dir[0], qubit.id[1] + neighbor_dir[1])
+                if neighbor_id in qubit.connectivity:
+                    link = qubit.connectivity[neighbor_id]
+                    f_2q_norm = self._normalize(link['fidelity_2q'], self.norm_factors['min_f2q'], self.norm_factors['max_f2q'])
+                    qubit_features.append(f_2q_norm)
+                else:
+                    qubit_features.append(0.0)  # 用0填充
+
+            qubit_embeddings[idx] = qubit_features
 
         # --- 2. 当前任务嵌入 (Current Task Embedding) ---
         task = self.task_pool[current_task_id]
@@ -162,7 +192,6 @@ class QuantumSchedulingEnv(gym.Env):
         # a. 标量特征 (空间和时间需求)
         num_q_norm = task.num_qubits / self.norm_factors['max_task_qubits']
         duration_norm = task.estimated_duration / self.norm_factors['max_task_duration']
-
         scalar_features = np.array([num_q_norm, duration_norm], dtype=np.float32)
 
         # b. 从任务对象中获取预计算好的GNN嵌入
@@ -200,6 +229,31 @@ class QuantumSchedulingEnv(gym.Env):
             "placement_mask": placement_mask,
             "logical_qubit_context": logical_qubit_context
         }
+
+    def _estimate_swaps_and_fidelity(self, task: QuantumTask, mapping: Dict) -> Tuple[int, float]:
+        """
+        辅助函数：估算给定映射所需的SWAP数量和最终保真度。
+        """
+        num_swaps = 0
+        graph = task.interaction_graph
+
+        # 遍历任务交互图中的每一条边（代表一个2Q门需求）
+        for u, v in graph.edges():
+            p_u, p_v = mapping[u], mapping[v]
+            # 如果物理上不相邻，就需要SWAP
+            if p_v not in self.chip_model[p_u].connectivity:
+                # 这是一个简化的估算，实际的SWAP数量取决于路由算法
+                # 我们这里简单地认为每条不满足的边都需要一次SWAP
+                num_swaps += 1
+
+        # 估算保真度
+        # 1. 基础保真度，来自所选比特
+        avg_f1q = np.mean([self.chip_model[pid].fidelity_1q for pid in mapping.values()])
+        # 2. 考虑门操作和SWAP引入的错误
+        total_error = task.depth * (1 - avg_f1q) + num_swaps * self.swap_penalty["error"]
+        final_fidelity = np.exp(-total_error)  # 一个常用的近似模型
+
+        return num_swaps, final_fidelity
 
     def reset(self, seed=None, options=None) -> Tuple[Dict, Dict]:
         """
@@ -252,12 +306,20 @@ class QuantumSchedulingEnv(gym.Env):
 
         # --- 2. 正常执行动作 ---
         task_id = action["task_id"]
-        # ... (与之前相同的动作执行代码) ...
         task = self.task_pool[task_id]
+        start_time = action["start_time"]
+        mapping = action["mapping"]
+
+        # --- 在执行前，估算SWAP和保真度 ---
+        num_swaps, final_fidelity = self._estimate_swaps_and_fidelity(task, mapping)
+
+        # 因SWAP而增加的额外时长
+        duration_penalty_swap = num_swaps * self.swap_penalty["duration"] / 1e3  # us
+
         task.is_scheduled = True
         self.current_step += 1
-        duration = task.estimated_duration
-        end_time = action["start_time"] + duration
+        duration = task.estimated_duration + duration_penalty_swap  # 总时长=估算+包含SWAP
+        end_time = start_time + duration
 
         # 创建一个临时的、更新后的调度计划来计算新状态
         next_schedule_plan = self.schedule_plan + [{
@@ -265,30 +327,43 @@ class QuantumSchedulingEnv(gym.Env):
             "start_time": action["start_time"], "end_time": end_time
         }]
 
-        # --- 3. 【全新】计算新的中间奖励 ---
+        # --- 3.计算多目标的中间奖励 ---
+        #  1>. 计算紧凑度奖励
         makespan_after = max(t['end_time'] for t in next_schedule_plan)
         idle_volume_after = self._calculate_idle_volume(next_schedule_plan, makespan_after)
-
         task_volume = len(action["mapping"]) * duration
-
         # 净空闲体积减少量 = (旧空闲) - (新空闲)
         idle_volume_reduction = idle_volume_before - idle_volume_after
-
         # 核心奖励公式：紧凑度得分
         # 这个得分衡量了每单位任务体积能带来多大的净空闲体积减少
         # 它是无界的，但可以用tanh将其映射到一个好的范围[-1, 1]
         compaction_score = (idle_volume_reduction / task_volume) if task_volume > 0 else 0.0
-
         # 使用tanh函数将得分映射到(-1, 1)，这是一个很好的归一化技巧
-        intermediate_reward = np.tanh(compaction_score)
+        reward_compaction = np.tanh(compaction_score)
 
-        # --- 4. 更新真实的环境状态 ---
-        self.schedule_plan = next_schedule_plan
-        for physical_q_id in action["mapping"].values():
-            self.chip_model[physical_q_id].booking_schedule.append((action["start_time"], end_time))
-            self.chip_model[physical_q_id].booking_schedule.sort()
+        # 2>. SWAP惩罚 (SWAP Penalty)
+        # 惩罚与SWAP数量的对数成正比，避免数值过大
+        penalty_swap = -np.log1p(num_swaps)
 
-        # --- 5. 确定终止和最终奖励 ---
+        # 3>. 保真度奖励 (Fidelity Reward)
+        # 保真度本身就在[0,1]区间，是一个很好的奖励
+        reward_fidelity = final_fidelity
+
+        # 4>. 串扰惩罚 (Crosstalk Penalty)
+        # (计算逻辑可以从之前的版本复用)
+        crosstalk_score = self._calculate_crosstalk(mapping, start_time, end_time)
+        # 归一化并取负值
+        penalty_crosstalk = -crosstalk_score / (task.num_qubits * 1.0)  # 粗略归一化
+
+        # --- 加权求和得到总中间奖励 ---
+        w = self.reward_weights  # 关键超参数！
+
+        intermediate_reward = (w["compaction"] * reward_compaction +
+                               w["swap"] * penalty_swap +
+                               w["fidelity"] * reward_fidelity +
+                               w["crosstalk"] * penalty_crosstalk)
+
+        # 5>. 确定终止和最终奖励 ---
         terminated = (self.current_step == self.num_tasks)
         final_reward_bonus = 0.0
         if terminated:
@@ -297,14 +372,26 @@ class QuantumSchedulingEnv(gym.Env):
 
         total_reward = intermediate_reward + final_reward_bonus
 
-        # ... (生成下一步观察并返回) ...
+        info = {
+            "num_swaps": num_swaps,
+            "final_fidelity": final_fidelity,
+            "crosstalk_score": crosstalk_score
+        }
+
+        # --- 4. 更新真实的环境状态 ---
+        self.schedule_plan = next_schedule_plan
+        for physical_q_id in action["mapping"].values():
+            self.chip_model[physical_q_id].booking_schedule.append((action["start_time"], end_time))
+            self.chip_model[physical_q_id].booking_schedule.sort()
+
+        # ... 生成下一步观察并返回...
         if not terminated:
             next_obs = self._get_obs(self.current_step, {})
         else:
             last_task_id = self.num_tasks - 1
             next_obs = self._get_obs(last_task_id, {})
 
-        return next_obs, total_reward, terminated, False, {}
+        return next_obs, total_reward, terminated, False, info
 
     def _estimate_fidelity(self, task: QuantumTask, mapping: Dict) -> float:
         # 占位符：基于所用比特的平均保真度
