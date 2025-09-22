@@ -343,17 +343,19 @@ class QuantumSchedulingEnv(gym.Env):
 
         # 2>. SWAP惩罚 (SWAP Penalty)
         # 惩罚与SWAP数量的对数成正比，避免数值过大
-        penalty_swap = -np.log1p(num_swaps)
+        penalty_swap = -np.clip(np.log1p(num_swaps), 0, 5.0)
 
         # 3>. 保真度奖励 (Fidelity Reward)
         # 保真度本身就在[0,1]区间，是一个很好的奖励
-        reward_fidelity = final_fidelity
+        min_acceptable_fidelity = 0.80
+        reward_fidelity = (final_fidelity - min_acceptable_fidelity) / (1.0 - min_acceptable_fidelity)
+        reward_fidelity = np.clip(reward_fidelity, 0, 1.0)  # 裁剪到[0, 1]
 
         # 4>. 串扰惩罚 (Crosstalk Penalty)
         # (计算逻辑可以从之前的版本复用)
         crosstalk_score = self._calculate_crosstalk(mapping, start_time, end_time)
         # 归一化并取负值
-        penalty_crosstalk = -crosstalk_score / (task.num_qubits * 1.0)  # 粗略归一化
+        penalty_crosstalk = -crosstalk_score * 5.0   # 粗略归一化
 
         # --- 加权求和得到总中间奖励 ---
         w = self.reward_weights  # 关键超参数！
