@@ -51,9 +51,9 @@ class Hyperparameters:
     # 奖励权重
     REWARD_WEIGHTS = {
         "compaction": 1.0,
-        "swap": 1.0,
-        "fidelity": 1.0,
-        "crosstalk": 1.0
+        "swap": 0.8,
+        "fidelity": 0.1,
+        "crosstalk": 0.2
     }
 
 
