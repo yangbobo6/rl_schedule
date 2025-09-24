@@ -79,6 +79,9 @@ class QuantumSchedulingEnv(gym.Env):
         D_GRAPH_EMBED = gnn_output_dim
         D_TASK = D_TASK_SCALAR + D_GRAPH_EMBED
 
+        # 1 (index) + 1 (connectivity_count) + 4*2 (neighbor_positions) = 10
+        D_LOGICAL_CONTEXT = 10
+
         print(f"Env Init: D_QUBIT={D_QUBIT}, D_TASK={D_TASK}")
 
         self.observation_space = spaces.Dict({
@@ -86,7 +89,7 @@ class QuantumSchedulingEnv(gym.Env):
             "qubit_embeddings": spaces.Box(low=0.0, high=1.0, shape=(self.num_qubits, D_QUBIT), dtype=np.float32),
             "current_task_embedding": spaces.Box(low=-1.0, high=1.0, shape=(D_TASK,), dtype=np.float32),
             "placement_mask": spaces.Box(low=0, high=1, shape=(self.num_qubits,), dtype=np.int8),
-            "logical_qubit_context": spaces.Box(low=0, high=1.0, shape=(2,), dtype=np.float32)
+            "logical_qubit_context": spaces.Box(low=0, high=self.max_qubits_per_task, shape=(D_LOGICAL_CONTEXT,), dtype=np.float32)
         })
 
     def _create_chip_model(self) -> Dict[Tuple[int, int], PhysicalQubit]:
@@ -217,11 +220,24 @@ class QuantumSchedulingEnv(gym.Env):
                     # 本次调度的逻辑比特和已经调度的比特连接性
                     connectivity_to_placed += 1
 
+        placed_neighbors_positions = []
+        if current_logical_idx < task.num_qubits and placement_in_progress:
+            graph = task.interaction_graph
+            for placed_logical_idx, placed_physical_id in placement_in_progress.items():
+                if graph.has_edge(current_logical_idx, placed_logical_idx):
+                    # 将物理位置归一化后加入
+                    norm_x = placed_physical_id[0] / (self.chip_size[0] - 1)
+                    norm_y = placed_physical_id[1] / (self.chip_size[1] - 1)
+                    placed_neighbors_positions.extend([norm_x, norm_y])
+
+        # 用0填充到固定长度 (例如，最多4个邻居)
+        while len(placed_neighbors_positions) < 4 * 2:
+            placed_neighbors_positions.extend([0.0, 0.0])
+
         logical_qubit_context = np.array([
-            # 当前逻辑比特在任务中的索引
-            current_logical_idx / self.max_qubits_per_task,
-            connectivity_to_placed / self.max_qubits_per_task
-        ], dtype=np.float32)
+                                             current_logical_idx / self.max_qubits_per_task,
+                                             connectivity_to_placed / self.max_qubits_per_task
+                                         ] + placed_neighbors_positions[:4 * 2], dtype=np.float32)
 
         return {
             "qubit_embeddings": qubit_embeddings,
@@ -343,7 +359,13 @@ class QuantumSchedulingEnv(gym.Env):
 
         # 2>. SWAP惩罚 (SWAP Penalty)
         # 惩罚与SWAP数量的对数成正比，避免数值过大
-        penalty_swap = -np.clip(np.log1p(num_swaps), 0, 5.0)
+        swap_duration_penalty = num_swaps * self.swap_penalty["duration"] / 1e3  # us
+        # a. 基于数量的惩罚 (线性)
+        penalty_swap_count = -num_swaps
+        # b. 基于时间的惩罚 (将时间惩罚也纳入奖励)
+        penalty_swap_time = -swap_duration_penalty / 1000.0  # 归一化
+        # 将两者结合
+        penalty_swap = penalty_swap_count + penalty_swap_time
 
         # 3>. 保真度奖励 (Fidelity Reward)
         # 保真度本身就在[0,1]区间，是一个很好的奖励

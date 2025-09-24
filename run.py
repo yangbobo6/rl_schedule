@@ -51,9 +51,9 @@ class Hyperparameters:
     # 奖励权重
     REWARD_WEIGHTS = {
         "compaction": 1.0,
-        "swap": 0.8,
+        "swap": 2.0,
         "fidelity": 0.1,
-        "crosstalk": 0.2
+        "crosstalk": 0.5
     }
 
 
@@ -230,10 +230,6 @@ def main():
         episode_fidelities = []
         episode_crosstalks = []
 
-        final_makespan = 0
-        final_avg_fidelity = 0
-        final_total_crosstalk = 0
-
         initial_obs_dict, info = env.reset()
         episode_reward = 0
 
@@ -324,11 +320,16 @@ def main():
         # --- 计算并记录最终的调度方案指标 ---
         if env.schedule_plan:
             final_makespan = max(t['end_time'] for t in env.schedule_plan)
+        else:
+            final_makespan = 0
 
         # --- 计算平均指标并写入TensorBoard ---
         avg_swaps = np.mean(episode_swaps) if episode_swaps else 0
         avg_final_fidelity = np.mean(episode_fidelities) if episode_fidelities else 0
         avg_crosstalk = np.mean(episode_crosstalks) if episode_crosstalks else 0
+
+        final_avg_fidelity = avg_final_fidelity
+        final_total_crosstalk = np.sum(episode_crosstalks) if episode_crosstalks else 0
 
         # 将最新的结果存入滑动窗口
         recent_rewards.append(episode_reward_sum)
@@ -363,7 +364,7 @@ def main():
         # 在update_ppo函数中，我们也可以记录loss
         # writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
         # ...
-        env.render()
+        # env.render()
         scheduler.step()
 
     episode_pbar.close()
