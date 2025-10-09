@@ -260,9 +260,45 @@ def main():
                     # Critic 输出的状态价值估计，表示当前状态预计能获得的未来回报
                     logits, value = model(obs_tensor)
 
-                # 应用掩码，防止选择已占用的比特
+                # 构建合法的动作掩码
+                # a. 获取已占用的比特掩码
                 placement_mask = torch.tensor(obs_dict["placement_mask"], dtype=torch.bool).to(device)
-                logits[0, placement_mask] = -1e8  # 将非法动作的logit设为极小值
+
+                # b. 获取连通性约束掩码
+                connectivity_mask = torch.ones_like(placement_mask)  # 初始假设所有动作都非法
+                current_logical_idx = i
+                task_graph = current_task.interaction_graph
+
+                if i == 0:
+                    # 如果是第一个比特，可以放在任何未占用的地方
+                    connectivity_mask = placement_mask.clone()  # 非法动作=已占用的
+                else:
+                    # 如果不是第一个，必须放在已放置比特的邻居中
+                    # 找到所有已放置比特的、尚未被占用的邻居
+                    valid_neighbors = set()
+                    for placed_logical_idx, placed_physical_id in placement_in_progress.items():
+                        # 检查当前比特是否需要与这个已放置的比特连接
+                        if task_graph.has_edge(current_logical_idx, placed_logical_idx):
+                            for neighbor_id in env.chip_model[placed_physical_id].connectivity:
+                                neighbor_idx = env.qubit_id_to_idx[neighbor_id]
+                                # 如果邻居未被占用，则为合法动作
+                                if not placement_mask[neighbor_idx]:
+                                    valid_neighbors.add(neighbor_idx)
+
+                    if valid_neighbors:
+                        # 如果有合法的邻居，则只允许在这些邻居中选择
+                        indices = torch.tensor(list(valid_neighbors), dtype=torch.long, device=device)
+                        connectivity_mask.scatter_(0, indices, 0)  # 将合法位置的掩码设为0 (False)
+                    else:
+                        # 棘手情况：如果所有邻居都被占用了怎么办？
+                        # 策略1：允许它放在任何未占用的地方（允许断开，依赖奖励来惩罚）
+                        connectivity_mask = placement_mask.clone()
+                        # 策略2：认为这是一个失败的放置，结束Episode并给予巨大惩罚 (更严格)
+
+                # c. 合并掩码
+                # 一个动作非法，当且仅当它已被占用 OR 它不满足连通性
+                final_mask = placement_mask | connectivity_mask
+                logits[0, final_mask] = -1e8  # 将非法动作的logit设为极小值
 
                 probs = Categorical(logits=logits) # PyTorch 的 Categorical 分布对象，把 logits 转换成概率分布
                 action = probs.sample()  # 采样一个动作 (物理比特的索引)

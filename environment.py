@@ -79,8 +79,8 @@ class QuantumSchedulingEnv(gym.Env):
         D_GRAPH_EMBED = gnn_output_dim
         D_TASK = D_TASK_SCALAR + D_GRAPH_EMBED
 
-        # 1 (index) + 1 (connectivity_count) + 4*2 (neighbor_positions) = 10
-        D_LOGICAL_CONTEXT = 10
+        # 1 (index) + 1 (connectivity_count) + 2(position) = 4
+        D_LOGICAL_CONTEXT = 4
 
         print(f"Env Init: D_QUBIT={D_QUBIT}, D_TASK={D_TASK}")
 
@@ -159,7 +159,7 @@ class QuantumSchedulingEnv(gym.Env):
         # --- 1. 芯片状态嵌入 (Qubit Embeddings) ---
         qubit_embeddings = np.zeros(self.observation_space["qubit_embeddings"].shape, dtype=np.float32)
 
-        max_current_time = 1.0
+        max_current_time = 1.0  # 初始化防止归一化时间除0错误
         if self.schedule_plan:
             makespan_so_far = max(t['end_time'] for t in self.schedule_plan)
             if makespan_so_far > 0:
@@ -172,12 +172,12 @@ class QuantumSchedulingEnv(gym.Env):
             y_norm = qubit.id[1] / (self.chip_size[1] - 1)
             next_avail_time_norm = qubit.get_next_available_time() / max_current_time
 
-            # b. 保真度特征
+            # b. 保真度特征  单量子比特门和读出保真度
             f_1q_norm = self._normalize(qubit.fidelity_1q, self.norm_factors['min_f1q'], self.norm_factors['max_f1q'])
             f_ro_norm = self._normalize(qubit.fidelity_readout, self.norm_factors['min_fro'], self.norm_factors['max_fro'])  # 假设范围
             qubit_features = [x_norm, y_norm, next_avail_time_norm, f_1q_norm, f_ro_norm]
 
-            # c. 邻居2Q门保真度 (用于学习连通性)
+            # c. 邻居2Q门保真度 (用于学习连通性)，上下左右将其加到后面
             for neighbor_dir in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
                 neighbor_id = (qubit.id[0] + neighbor_dir[0], qubit.id[1] + neighbor_dir[1])
                 if neighbor_id in qubit.connectivity:
@@ -209,35 +209,44 @@ class QuantumSchedulingEnv(gym.Env):
             for physical_q_id in placement_in_progress.values():
                 placement_mask[self.qubit_id_to_idx[physical_q_id]] = 1
 
-        # --- 4. 当前逻辑比特上下文 (Logical Qubit Context) ---
+        # --- 4. 当前逻辑比特上下文 (Logical Qubit Context) ---  placement_in_progress -> {0:(0,5) 1:(1,4)}
+        # current_logical_idx 当前要放置的逻辑比特索引
         current_logical_idx = len(placement_in_progress) if placement_in_progress else 0
 
+        # 已放置的邻居的物理坐标位置
+        avg_neighbor_x = 0.0
+        avg_neighbor_y = 0.0
         connectivity_to_placed = 0
-        if current_logical_idx < task.num_qubits and placement_in_progress:
-            graph = task.interaction_graph
-            for placed_logical_idx in placement_in_progress.keys():
-                if graph.has_edge(current_logical_idx, placed_logical_idx):
-                    # 本次调度的逻辑比特和已经调度的比特连接性
-                    connectivity_to_placed += 1
+        placed_neighbors_positions_list = []
 
-        placed_neighbors_positions = []
         if current_logical_idx < task.num_qubits and placement_in_progress:
             graph = task.interaction_graph
             for placed_logical_idx, placed_physical_id in placement_in_progress.items():
                 if graph.has_edge(current_logical_idx, placed_logical_idx):
-                    # 将物理位置归一化后加入
-                    norm_x = placed_physical_id[0] / (self.chip_size[0] - 1)
-                    norm_y = placed_physical_id[1] / (self.chip_size[1] - 1)
-                    placed_neighbors_positions.extend([norm_x, norm_y])
+                    connectivity_to_placed += 1
+                    # 将物理坐标存入列表，用于后续计算
+                    placed_neighbors_positions_list.append(placed_physical_id)
 
-        # 用0填充到固定长度 (例如，最多4个邻居)
-        while len(placed_neighbors_positions) < 4 * 2:
-            placed_neighbors_positions.extend([0.0, 0.0])
+        if connectivity_to_placed > 0:
+            # 计算所有已放置邻居的物理坐标的平均值（重心）
+            avg_neighbor_x = np.mean([pos[0] for pos in placed_neighbors_positions_list])
+            avg_neighbor_y = np.mean([pos[1] for pos in placed_neighbors_positions_list])
 
+            # (可选) 计算标准差
+            # std_neighbor_x = np.std([pos[0] for pos in placed_neighbors_positions_list])
+            # std_neighbor_y = np.std([pos[1] for pos in placed_neighbors_positions_list])
+
+        # 归一化
+        norm_avg_x = avg_neighbor_x / (self.chip_size[0] - 1) if self.chip_size[0] > 1 else 0
+        norm_avg_y = avg_neighbor_y / (self.chip_size[1] - 1) if self.chip_size[1] > 1 else 0
+
+        # 上下文向量，长度固定为4
         logical_qubit_context = np.array([
-                                             current_logical_idx / self.max_qubits_per_task,
-                                             connectivity_to_placed / self.max_qubits_per_task
-                                         ] + placed_neighbors_positions[:4 * 2], dtype=np.float32)
+            current_logical_idx / self.max_qubits_per_task,
+            connectivity_to_placed / self.max_qubits_per_task,
+            norm_avg_x,  # 邻居重心的X坐标
+            norm_avg_y  # 邻居重心的Y坐标
+        ], dtype=np.float32)
 
         return {
             "qubit_embeddings": qubit_embeddings,
