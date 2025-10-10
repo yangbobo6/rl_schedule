@@ -50,10 +50,11 @@ class Hyperparameters:
 
     # 奖励权重
     REWARD_WEIGHTS = {
-        "compaction": 1.0,
-        "swap": 2.0,
-        "fidelity": 0.1,
-        "crosstalk": 0.5
+        "compaction": 1.0, # 时间压缩
+        "swap": 1.5,       # swap次数
+        "fidelity": 0.2,   # 保真度
+        "crosstalk": 0.5,  # 串扰
+        "matching": 0.8    # 启发式奖励权重
     }
 
 
@@ -262,9 +263,10 @@ def main():
 
                 # 构建合法的动作掩码
                 # a. 获取已占用的比特掩码
+                # tensor([False, False, False, ...]),标记哪些物理比特已经被占用
                 placement_mask = torch.tensor(obs_dict["placement_mask"], dtype=torch.bool).to(device)
 
-                # b. 获取连通性约束掩码
+                # b. 获取连通性约束掩码,基于量子芯片的连通性约束来限制动作选择
                 connectivity_mask = torch.ones_like(placement_mask)  # 初始假设所有动作都非法
                 current_logical_idx = i
                 task_graph = current_task.interaction_graph

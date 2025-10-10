@@ -50,6 +50,8 @@ class QuantumSchedulingEnv(gym.Env):
         # --- 预计算用于归一化的值 ---
         self._precompute_normalization_factors()
 
+        self.sorted_physical_qubits = self._rank_physical_qubits()
+
         # 建立物理比特ID到索引的映射
         self.qubit_id_to_idx = {qid: i for i, qid in enumerate(sorted(self.chip_model.keys()))}
         self.idx_to_qubit_id = {i: qid for qid, i in self.qubit_id_to_idx.items()}
@@ -128,6 +130,30 @@ class QuantumSchedulingEnv(gym.Env):
         """使用TaskGenerator从large_task_pool中采样创建任务池"""
         print(f"Sampling {self.num_tasks} tasks from TaskGenerator's large_task_pool...")
         return self.task_generator.get_episode_tasks(self.num_tasks)
+
+    def _rank_physical_qubits(self) -> list:
+        """
+        辅助函数：计算每个物理比特的综合质量得分，并按得分从高到低排序。
+        """
+        qubit_scores = []
+        for q_id, qubit in self.chip_model.items():
+            # 计算平均2Q门保真度
+            avg_f2q = 0.0
+            if qubit.connectivity:
+                avg_f2q = np.mean([link['fidelity_2q'] for link in qubit.connectivity.values()])
+
+            # 质量分 = w1 * 度数 + w2 * 平均2Q保真度 + w3 * 1Q保真度
+            # 这里的权重可以根据经验调整
+            score = (
+                    0.2 * len(qubit.connectivity) +  # 度数权重
+                    0.5 * (avg_f2q - 0.95) +  # 2Q保真度权重 (减去基准值)
+                    0.3 * (qubit.fidelity_1q - 0.99)  # 1Q保真度权重
+            )
+            qubit_scores.append((qubit, score))
+
+        # 按得分降序排序
+        sorted_qubits = [q for q, score in sorted(qubit_scores, key=lambda x: x[1], reverse=True)]
+        return sorted_qubits
 
     def _precompute_normalization_factors(self):
         """只预计算需要的因子"""
@@ -352,6 +378,41 @@ class QuantumSchedulingEnv(gym.Env):
             "start_time": action["start_time"], "end_time": end_time
         }]
 
+        # 2.5. 对当前任务的逻辑比特按度数从高到低排序
+        graph = task.interaction_graph
+        # graph.degree返回的是 (node, degree) 的元组列表
+        sorted_logical_qubits = sorted(graph.degree, key=lambda x: x[1], reverse=True)
+
+        match_score = 0
+        num_logical_to_check = len(sorted_logical_qubits)
+
+        # 获取芯片质量最高的前N个物理比特，N=任务大小
+        top_physical_qubits = self.sorted_physical_qubits[:num_logical_to_check]
+
+        # 遍历排序后的逻辑比特
+        for i in range(num_logical_to_check):
+            logical_qubit_id, _ = sorted_logical_qubits[i]
+
+            # 找到它被映射到了哪个物理比特
+            mapped_physical_id = mapping[logical_qubit_id]
+            mapped_physical_qubit_obj = self.chip_model[mapped_physical_id]
+
+            # 检查这个物理比特是否在“优等生”名单里
+            # 为了奖励更精确，我们检查排名是否匹配
+            # 例如，最重要的逻辑比特是否映射到了最重要的物理比特之一？
+
+            # 简化版奖励：只要映射到了Top-N就算匹配
+            if mapped_physical_qubit_obj in top_physical_qubits:
+                # 权重可以根据排名递减，最重要的匹配得分最高
+                # 例如，排名第一的逻辑比特，如果映射到了排名前1/3的物理比特，得分
+                rank_score = (num_logical_to_check - i) / num_logical_to_check
+                match_score += rank_score
+
+        # 归一化匹配分数
+        # 最大可能的match_score是所有rank_score的总和
+        max_possible_score = sum((num_logical_to_check - i) / num_logical_to_check for i in range(num_logical_to_check))
+        reward_matching = match_score / max_possible_score if max_possible_score > 0 else 0.0
+
         # --- 3.计算多目标的中间奖励 ---
         #  1>. 计算紧凑度奖励
         makespan_after = max(t['end_time'] for t in next_schedule_plan)
@@ -394,7 +455,8 @@ class QuantumSchedulingEnv(gym.Env):
         intermediate_reward = (w["compaction"] * reward_compaction +
                                w["swap"] * penalty_swap +
                                w["fidelity"] * reward_fidelity +
-                               w["crosstalk"] * penalty_crosstalk)
+                               w["crosstalk"] * penalty_crosstalk +
+                               w["matching"] * reward_matching)  # <-- 新增奖励项
 
         # 5>. 确定终止和最终奖励 ---
         terminated = (self.current_step == self.num_tasks)
