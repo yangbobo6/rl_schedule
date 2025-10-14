@@ -54,7 +54,7 @@ class Hyperparameters:
         "swap": 1.5,       # swap次数
         "fidelity": 0.2,   # 保真度
         "crosstalk": 0.5,  # 串扰
-        "matching": 0.8    # 启发式奖励权重
+        "matching": 0.7    # 启发式奖励权重
     }
 
 
@@ -272,30 +272,33 @@ def main():
                 task_graph = current_task.interaction_graph
 
                 if i == 0:
-                    # 如果是第一个比特，可以放在任何未占用的地方
-                    connectivity_mask = placement_mask.clone()  # 非法动作=已占用的
+                    # 第一个比特可以放在任何未占用的地方
+                    connectivity_mask = placement_mask.clone()
                 else:
-                    # 如果不是第一个，必须放在已放置比特的邻居中
-                    # 找到所有已放置比特的、尚未被占用的邻居
                     valid_neighbors = set()
-                    for placed_logical_idx, placed_physical_id in placement_in_progress.items():
-                        # 检查当前比特是否需要与这个已放置的比特连接
-                        if task_graph.has_edge(current_logical_idx, placed_logical_idx):
-                            for neighbor_id in env.chip_model[placed_physical_id].connectivity:
-                                neighbor_idx = env.qubit_id_to_idx[neighbor_id]
-                                # 如果邻居未被占用，则为合法动作
-                                if not placement_mask[neighbor_idx]:
-                                    valid_neighbors.add(neighbor_idx)
+                    # 检查当前逻辑比特 l_i 是否需要与任何已放置的比特 l_j 连接
+                    needs_connection = any(
+                        task_graph.has_edge(current_logical_idx, j) for j in placement_in_progress.keys())
 
-                    if valid_neighbors:
-                        # 如果有合法的邻居，则只允许在这些邻居中选择
-                        indices = torch.tensor(list(valid_neighbors), dtype=torch.long, device=device)
-                        connectivity_mask.scatter_(0, indices, 0)  # 将合法位置的掩码设为0 (False)
-                    else:
-                        # 棘手情况：如果所有邻居都被占用了怎么办？
-                        # 策略1：允许它放在任何未占用的地方（允许断开，依赖奖励来惩罚）
+                    if not needs_connection:
+                        # 如果 l_i 与已放置的部分没有连接（例如，一个任务包含两个独立的组件）
+                        # 那么它可以放在任何未占用的地方
                         connectivity_mask = placement_mask.clone()
-                        # 策略2：认为这是一个失败的放置，结束Episode并给予巨大惩罚 (更严格)
+                    else:
+                        # 否则，它必须放在已放置邻居的空闲邻居位置
+                        for placed_logical_idx, placed_physical_id in placement_in_progress.items():
+                            if task_graph.has_edge(current_logical_idx, placed_logical_idx):
+                                for neighbor_id in env.chip_model[placed_physical_id].connectivity:
+                                    neighbor_idx = env.qubit_id_to_idx[neighbor_id]
+                                    if not placement_mask[neighbor_idx]:
+                                        valid_neighbors.add(neighbor_idx)
+
+                        if valid_neighbors:
+                            indices = torch.tensor(list(valid_neighbors), dtype=torch.long, device=device)
+                            connectivity_mask.scatter_(0, indices, 0)  # 将合法位置的掩码设为False
+                        else:
+                            # 如果所有邻居都被占用了，允许它放在任何未占用的地方，依赖奖励惩罚
+                            connectivity_mask = placement_mask.clone()
 
                 # c. 合并掩码
                 # 一个动作非法，当且仅当它已被占用 OR 它不满足连通性
@@ -306,12 +309,26 @@ def main():
                 action = probs.sample()  # 采样一个动作 (物理比特的索引)
                 log_prob = probs.log_prob(action)
 
+                # --- 计算微观奖励 ---
+                micro_reward = 0
+                chosen_physical_id = env.idx_to_qubit_id[action.item()]
+
+                # 检查当前选择是否与已放置的邻居物理相连
+                for placed_logic_idx, placed_phys_id in placement_in_progress.items():
+                    if task_graph.has_edge(current_logical_idx, placed_logic_idx):
+                        if chosen_physical_id in env.chip_model[placed_phys_id].connectivity:
+                            micro_reward += 0.1
+                        else:
+                            # 如果硬约束生效，理论上不会走到这里。
+                            # 但如果硬约束被放宽（例如 valid_neighbors 为空时），这个惩罚就至关重要
+                            micro_reward -= 0.1
+
                 # 3. 存储经验
                 rollout_buffer["obs"].append(obs_dict)
                 rollout_buffer["actions"].append(action.cpu().numpy())
                 rollout_buffer["log_probs"].append(log_prob.cpu().numpy())
                 rollout_buffer["values"].append(value.cpu().numpy())
-                rollout_buffer["rewards"].append(0)  # 中间奖励为0
+                rollout_buffer["rewards"].append(micro_reward)
                 rollout_buffer["dones"].append(False)
 
                 # 4. 更新进行中的放置

@@ -444,7 +444,6 @@ class QuantumSchedulingEnv(gym.Env):
         reward_fidelity = np.clip(reward_fidelity, 0, 1.0)  # 裁剪到[0, 1]
 
         # 4>. 串扰惩罚 (Crosstalk Penalty)
-        # (计算逻辑可以从之前的版本复用)
         crosstalk_score = self._calculate_crosstalk(mapping, start_time, end_time)
         # 归一化并取负值
         penalty_crosstalk = -crosstalk_score * 5.0   # 粗略归一化
@@ -546,7 +545,7 @@ class QuantumSchedulingEnv(gym.Env):
     
     def visualize_connectivity(self, save_path: str = None):
         """可视化芯片连接矩阵"""
-        self.visualizer.visualize_connectivity_matrix(save_path)
+        self.visualizer.visualize_connectivity_with_edge_labels(save_path)
     
     def export_chip_stats(self, save_path: str = None):
         """导出芯片统计信息"""

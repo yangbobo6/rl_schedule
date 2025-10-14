@@ -2,12 +2,16 @@
 量子芯片可视化工具
 提供多种可视化方式来展示量子芯片的物理属性、连接性和状态信息
 """
+import math
 
 import matplotlib.pyplot as plt
 import numpy as np
 import networkx as nx
 from typing import Dict, Tuple, List, Optional
 import os
+
+from matplotlib import cm
+from matplotlib.colors import Normalize
 
 
 class QuantumChipVisualizer:
@@ -237,50 +241,135 @@ class QuantumChipVisualizer:
         ax.set_yticks(range(self.rows))
         
         plt.colorbar(im, ax=ax, shrink=0.8)
-        
-    def visualize_connectivity_matrix(self, save_path: Optional[str] = None):
+
+    def visualize_connectivity_with_edge_labels(self, save_path: Optional[str] = None, positions: dict = None):
         """
-        可视化连接矩阵，这是量子芯片架构分析的标准方法
+        在芯片图上绘制节点与边，并在边上标注双比特门保真度。
+        - self.chip_model: dict, key=qubit_id, value=qubit object with .connectivity mapping neighbor->conn_info
+        - positions: optional dict {qubit_id: (x,y)} 如果传入则使用，否则尝试按接近方形网格自动布局
         """
-        # 创建连接矩阵
+        # 准备数据
         n_qubits = len(self.chip_model)
         qubit_list = sorted(self.chip_model.keys())
         qubit_to_idx = {qid: i for i, qid in enumerate(qubit_list)}
-        
-        connectivity_matrix = np.zeros((n_qubits, n_qubits))
-        fidelity_matrix = np.zeros((n_qubits, n_qubits))
-        
+
+        # 收集边和保真度
+        edges = []
+        fidelities = []
         for qid, qubit in self.chip_model.items():
             i = qubit_to_idx[qid]
             for neighbor_id, conn_info in qubit.connectivity.items():
+                # 避免重复添加无向边 —— 只添加 i < j 的边（如果是有向网络，根据情况调整）
+                if neighbor_id not in qubit_to_idx:
+                    continue
                 j = qubit_to_idx[neighbor_id]
-                connectivity_matrix[i, j] = 1
-                fidelity_matrix[i, j] = conn_info['fidelity_2q']
-        
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-        fig.suptitle('Quantum Chip Connectivity Analysis', fontsize=14, fontweight='bold')
-        
-        # 连接矩阵
-        im1 = ax1.imshow(connectivity_matrix, cmap='Blues', aspect='equal')
-        ax1.set_title('Connectivity Matrix')
-        ax1.set_xlabel('Qubit Index')
-        ax1.set_ylabel('Qubit Index')
-        
-        # 保真度矩阵
-        im2 = ax2.imshow(fidelity_matrix, cmap='RdYlGn', aspect='equal', vmin=0.95, vmax=1.0)
-        ax2.set_title('Two-Qubit Gate Fidelity Matrix')
-        ax2.set_xlabel('Qubit Index')
-        ax2.set_ylabel('Qubit Index')
-        
-        plt.colorbar(im1, ax=ax1, shrink=0.8)
-        plt.colorbar(im2, ax=ax2, shrink=0.8)
+                if i < j:
+                    fid = conn_info.get('fidelity_2q', 0.0)
+                    edges.append((qid, neighbor_id))
+                    fidelities.append(float(fid))
+
+        # 如果没有边，直接提示并画出节点
+        if len(edges) == 0:
+            print("No connectivity edges found in chip_model.")
+
+        # 节点位置：如果没有传入 positions，尝试近似方形网格布局
+        if positions is None:
+            # 尝试取接近平方的行列数
+            rows = int(math.sqrt(n_qubits))
+            if rows * rows < n_qubits:
+                rows = rows
+            cols = math.ceil(n_qubits / rows)
+            # 放置节点：按行优先（row, col），y 轴上反向以匹配常见芯片图视觉（0 在底部）
+            positions = {}
+            for idx, qid in enumerate(qubit_list):
+                r = idx // cols
+                c = idx % cols
+                # x = column, y = rows - 1 - row 使得索引 0 在左下角
+                positions[qid] = (c, rows - 1 - r)
+
+        # 构建 NetworkX 图用于绘制
+        G = nx.Graph()
+        G.add_nodes_from(qubit_list)
+        G.add_edges_from(edges)
+
+        # 设置 colormap 范围（忽略 0 的无效值）
+        if len(fidelities) > 0:
+            fid_array = np.array(fidelities)
+            valid_mask = fid_array > 0
+            if valid_mask.any():
+                vmin = float(np.min(fid_array[valid_mask]))
+                vmax = float(np.max(fid_array[valid_mask]))
+            else:
+                vmin, vmax = 0.0, 1.0
+        else:
+            vmin, vmax = 0.0, 1.0
+
+        # 防止 vmin==vmax 导致归一化出错
+        if vmin == vmax:
+            vmin = max(0.0, vmin - 0.01)
+            vmax = min(1.0, vmax + 0.01)
+
+        norm = Normalize(vmin=vmin, vmax=vmax)
+        cmap = cm.get_cmap('RdYlGn')
+
+        # 将边映射到颜色与宽度
+        edge_colors = []
+        edge_widths = []
+        for fid in fidelities:
+            # 若 fid 为 0（表示无连接或者未设置），设置为灰色/细线
+            if fid <= 0:
+                edge_colors.append((0.6, 0.6, 0.6, 0.4))
+                edge_widths.append(0.5)
+            else:
+                edge_colors.append(cmap(norm(fid)))
+                # 宽度按保真度线性映射，保证可视差异
+                edge_widths.append(0.5 + 4.0 * ((fid - vmin) / (vmax - vmin)))
+
+        # 绘图
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.set_title('Quantum Chip — Two-Qubit Fidelity on Edges', fontsize=14, fontweight='bold')
+
+        # 画节点
+        nx.draw_networkx_nodes(G, positions, node_size=350, node_color='lightgrey', ax=ax, edgecolors='k')
+        # 节点标签为 qubit 索引或 id（这里用索引方便对应矩阵）
+        idx_labels = {qid: str(qubit_to_idx[qid]) for qid in qubit_list}
+        nx.draw_networkx_labels(G, positions, labels=idx_labels, font_size=9, ax=ax)
+
+        # 画边
+        nx.draw_networkx_edges(G, positions, edgelist=edges, edge_color=edge_colors, width=edge_widths, ax=ax)
+
+        # 在每条边上标注保真度（中点处）
+        for (u, v), fid in zip(edges, fidelities):
+            (xu, yu) = positions[u]
+            (xv, yv) = positions[v]
+            xm = (xu + xv) / 2.0
+            ym = (yu + yv) / 2.0
+            if fid > 0:
+                txt = f"{fid:.3f}"
+                # 若边比较倾斜，稍微偏移 label，避免与边重叠
+                dx = (yv - yu) * 0.08
+                dy = (xu - xv) * 0.02
+                ax.text(xm + dx, ym + dy, txt, fontsize=8, ha='center', va='center',
+                        bbox=dict(boxstyle='round,pad=0.1', fc='white', ec='none', alpha=0.7))
+            else:
+                # 可选择不标注无效边
+                pass
+
+        # colorbar：用一个 ScalarMappable 来生成色条
+        from matplotlib.cm import ScalarMappable
+        sm = ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])  # 仅为 colorbar 使用
+        cbar = plt.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label('Two-Qubit Gate Fidelity')
+
+        ax.axis('off')
         plt.tight_layout()
-        
+
         if save_path:
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Connectivity matrix saved to: {save_path}")
-            
+            print(f"Chip connectivity with fidelities saved to: {save_path}")
+
         plt.show()
         
     def export_chip_stats(self, save_path: Optional[str] = None) -> Dict:
