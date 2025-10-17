@@ -9,9 +9,8 @@ from tqdm import tqdm
 
 # --- 1. 导入自定义模块 ---
 from environment import QuantumSchedulingEnv
-from models.actor_critic import CNNActorCritic, TransformerActorCritic
+from models.actor_critic import TransformerActorCritic
 from models.gnn_encoder import GNNEncoder
-from models.quantum_task import QuantumTask  # 确保__init__.py工作正常
 from torch.utils.tensorboard import SummaryWriter # 导入TensorBoard的Writer
 import time
 import os # 导入os模块
@@ -56,60 +55,6 @@ class Hyperparameters:
         "crosstalk": 0.5,  # 串扰
         "matching": 0.7    # 启发式奖励权重
     }
-
-
-# --- 3. 定义Actor-Critic网络 ---
-# 这是一个简化的MLP版本，作为起点。之后可以替换为Transformer。
-class ActorCritic(nn.Module):
-    def __init__(self, obs_space, action_space_dim):
-        super(ActorCritic, self).__init__()
-
-        # 简化: 将字典观察空间展平
-        # 实际中，Transformer能更好地处理结构化数据
-        qubit_embed_dim = np.prod(obs_space["qubit_embeddings"].shape)
-        task_embed_dim = np.prod(obs_space["current_task_embedding"].shape)
-        placement_mask_dim = np.prod(obs_space["placement_mask"].shape)
-        logic_context_dim = np.prod(obs_space["logical_qubit_context"].shape)
-
-        input_dim = qubit_embed_dim + task_embed_dim + placement_mask_dim + logic_context_dim
-
-        # 共享层
-        self.shared_net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU()
-        )
-
-        # Actor头 (输出动作概率)
-        self.actor_head = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, action_space_dim)  # 输出每个物理比特的logits
-        )
-
-        # Critic头 (输出状态价值)
-        self.critic_head = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)  # 输出一个标量值
-        )
-
-    def forward(self, obs):
-        # 将字典观察展平并拼接
-        flat_obs = torch.cat([
-            obs["qubit_embeddings"].flatten(start_dim=1),
-            obs["current_task_embedding"].flatten(start_dim=1),
-            obs["placement_mask"].flatten(start_dim=1).float(),
-            obs["logical_qubit_context"].flatten(start_dim=1)
-        ], dim=1)
-
-        shared_features = self.shared_net(flat_obs)
-
-        action_logits = self.actor_head(shared_features)
-        state_value = self.critic_head(shared_features)
-
-        return action_logits, state_value
 
 
 # --- 4. 主函数 ---
@@ -227,15 +172,76 @@ def main():
         # --- 宏观循环: 调度一个完整的方案 ---
         # 在Episode开始前，记录一下最终的统计数据
         episode_reward_sum = 0.0  # 用于累加本episode的总奖励
-        episode_swaps = []
-        episode_fidelities = []
-        episode_crosstalks = []
-
+        episode_swaps, episode_fidelities, episode_crosstalks = [], [], []
+        episode_size_priority_scores = []
+        episode_comm_priority_scores = []
         initial_obs_dict, info = env.reset()
-        episode_reward = 0
 
-        for task_id in range(env.num_tasks):
-            current_task = env.task_pool[task_id]
+        for chosen_task_id in range(env.num_tasks):
+            # --------------------------------------------------
+            # === 阶段一: 任务选择决策 ===
+            # --------------------------------------------------
+            # 1. 获取包含所有未调度任务的全局观察
+            # 在任务选择阶段，没有进行中的放置，也没有预选的任务
+            task_selection_obs_dict = env._get_obs(placement_in_progress=None, task_for_placement=None)
+            task_selection_obs_tensor = {k: torch.tensor(v).unsqueeze(0).to(device) for k, v in
+                                         task_selection_obs_dict.items()}
+
+            # 2. 智能体决策
+            with torch.no_grad():
+                # 假设model返回 (task_logits, placement_logits, value)
+                task_logits, _, value_for_task_selection = model(task_selection_obs_tensor)
+
+            # 3. 应用掩码并采样
+            task_mask = torch.tensor(task_selection_obs_dict["task_mask"], dtype=torch.bool).to(device)
+            task_logits[0, task_mask] = -1e8
+
+            task_probs = Categorical(logits=task_logits)
+            chosen_task_id_tensor = task_probs.sample()
+            chosen_task_id = chosen_task_id_tensor.item()
+            task_log_prob = task_probs.log_prob(chosen_task_id_tensor)
+
+            # 计算得分
+            # a. 获取所有合法选择（未调度的任务）的列表
+            current_task_mask = task_selection_obs_dict["task_mask"]
+            legal_tasks = [env.task_pool[i] for i, masked in enumerate(current_task_mask) if not masked]
+
+            if legal_tasks:
+                chosen_task_obj = env.task_pool[chosen_task_id]
+
+                # b. 计算尺寸优先级得分
+                # 为了不影响原始列表，我们复制并排序
+                sorted_by_size = sorted(legal_tasks, key=lambda t: t.num_qubits, reverse=True)
+                try:
+                    rank = sorted_by_size.index(chosen_task_obj)
+                    size_priority_score = (len(legal_tasks) - 1 - rank) / (len(legal_tasks) - 1) if len(
+                        legal_tasks) > 1 else 1.0
+                    episode_size_priority_scores.append(size_priority_score)
+                except ValueError:
+                    pass
+
+                # c. 计算通信优先级得分
+                sorted_by_comm = sorted(legal_tasks, key=lambda t: t.interaction_graph.number_of_edges(), reverse=True)
+                try:
+                    rank = sorted_by_comm.index(chosen_task_obj)
+                    comm_priority_score = (len(legal_tasks) - 1 - rank) / (len(legal_tasks) - 1) if len(
+                        legal_tasks) > 1 else 1.0
+                    episode_comm_priority_scores.append(comm_priority_score)
+                except ValueError:
+                    pass
+
+            # 4. 存储任务选择的经验 (这是第一个宏观步骤的经验)
+            rollout_buffer["obs"].append(task_selection_obs_dict)
+            rollout_buffer["actions"].append(np.array([chosen_task_id]))  # 动作是任务ID
+            rollout_buffer["log_probs"].append(task_log_prob.cpu().numpy())
+            rollout_buffer["values"].append(value_for_task_selection.cpu().numpy())
+            rollout_buffer["rewards"].append(0)  # 奖励将在后面分配
+            rollout_buffer["dones"].append(False)
+
+            # --------------------------------------------------
+            # === 阶段二: 放置决策 (微观循环) ===
+            # --------------------------------------------------
+            current_task = env.task_pool[chosen_task_id]
             num_logical_qubits = current_task.num_qubits
             placement_in_progress = {}
 
@@ -243,31 +249,26 @@ def main():
             for i in range(num_logical_qubits):
                 global_step += 1
 
-                # 1. 获取观察
-                if task_id == 0 and i == 0:
-                    # 对于整个episode的第一次决策，使用reset返回的obs
-                    obs_dict = initial_obs_dict
-                else:
-                    # 对于后续决策，正常调用_get_obs
-                    obs_dict = env._get_obs(task_id, placement_in_progress)
-
-                # 将Numpy观察转换为Torch张量
-                obs_tensor = {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(device) for k, v in
-                              obs_dict.items()}
+                # 1. 获取为当前放置决策定制的观察
+                placement_obs_dict = env._get_obs(
+                    placement_in_progress=placement_in_progress,
+                    task_for_placement=current_task
+                )
+                placement_obs_tensor = {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(device) for k, v in
+                                        placement_obs_dict.items()}
 
                 # 2. 智能体决策
                 with torch.no_grad():
-                    # 模型输出的每个动作（这里是每个物理比特）对应的未归一化的分数
-                    # Critic 输出的状态价值估计，表示当前状态预计能获得的未来回报
-                    logits, value = model(obs_tensor)
+                    # 模型返回 (task_logits, placement_logits, value)
+                    _, placement_logits, value_for_placement = model(placement_obs_tensor)
 
                 # 构建合法的动作掩码
                 # a. 获取已占用的比特掩码
                 # tensor([False, False, False, ...]),标记哪些物理比特已经被占用
-                placement_mask = torch.tensor(obs_dict["placement_mask"], dtype=torch.bool).to(device)
+                placement_mask = torch.tensor(placement_obs_dict["placement_mask"], dtype=torch.bool).to(device)
 
                 # b. 获取连通性约束掩码,基于量子芯片的连通性约束来限制动作选择
-                connectivity_mask = torch.ones_like(placement_mask)  # 初始假设所有动作都非法
+                connectivity_mask = torch.ones_like(placement_mask)
                 current_logical_idx = i
                 task_graph = current_task.interaction_graph
 
@@ -303,15 +304,15 @@ def main():
                 # c. 合并掩码
                 # 一个动作非法，当且仅当它已被占用 OR 它不满足连通性
                 final_mask = placement_mask | connectivity_mask
-                logits[0, final_mask] = -1e8  # 将非法动作的logit设为极小值
+                placement_logits[0, final_mask] = -1e8  # 将非法动作的logit设为极小值
 
-                probs = Categorical(logits=logits) # PyTorch 的 Categorical 分布对象，把 logits 转换成概率分布
-                action = probs.sample()  # 采样一个动作 (物理比特的索引)
-                log_prob = probs.log_prob(action)
+                placement_probs = Categorical(logits=placement_logits) # PyTorch 的 Categorical 分布对象，把 logits 转换成概率分布
+                placement_action_tensor = placement_probs.sample()
+                placement_log_prob = placement_probs.log_prob(placement_action_tensor)
 
                 # --- 计算微观奖励 ---
                 micro_reward = 0
-                chosen_physical_id = env.idx_to_qubit_id[action.item()]
+                chosen_physical_id = env.idx_to_qubit_id[placement_action_tensor.item()]
 
                 # 检查当前选择是否与已放置的邻居物理相连
                 for placed_logic_idx, placed_phys_id in placement_in_progress.items():
@@ -324,21 +325,22 @@ def main():
                             micro_reward -= 0.1
 
                 # 3. 存储经验
-                rollout_buffer["obs"].append(obs_dict)
-                rollout_buffer["actions"].append(action.cpu().numpy())
-                rollout_buffer["log_probs"].append(log_prob.cpu().numpy())
-                rollout_buffer["values"].append(value.cpu().numpy())
+                rollout_buffer["obs"].append(placement_obs_dict)
+                rollout_buffer["actions"].append(placement_action_tensor.cpu().numpy())  # 动作是物理比特ID
+                rollout_buffer["log_probs"].append(placement_log_prob.cpu().numpy())
+                rollout_buffer["values"].append(value_for_placement.cpu().numpy())
                 rollout_buffer["rewards"].append(micro_reward)
                 rollout_buffer["dones"].append(False)
 
                 # 4. 更新进行中的放置
-                physical_qubit_id = env.idx_to_qubit_id[action.item()]  # 将action的下表（例如2）转换为qubit_id 例如(2,3)
-                placement_in_progress[i] = physical_qubit_id #dict (0:(2,3), 1:(2,4), 2:(3,3), 3:(3,4))
+                # 将action的下表（例如2）转换为qubit_id 例如(2,3)
+                placement_in_progress[i] = chosen_physical_id #dict (0:(2,3), 1:(2,4), 2:(3,3), 3:(3,4))
 
                 # 5. 检查是否需要更新网络
                 if len(rollout_buffer["actions"]) >= args.ROLLOUT_LENGTH:
-                    update_ppo(model, optimizer, rollout_buffer, args, device, value, writer, global_step)
-                    # 清空缓冲区
+                    with torch.no_grad():
+                        _, _, last_value = model(placement_obs_tensor)
+                    update_ppo(model, optimizer, rollout_buffer, args, device, last_value, writer, global_step)
                     for k in rollout_buffer: rollout_buffer[k] = []
 
             # --- 放置完成后，提交计划给环境 ---
@@ -347,7 +349,7 @@ def main():
             if final_mapping:
                 start_time = max(env.chip_model[pid].get_next_available_time() for pid in final_mapping.values())
 
-            full_action = {"task_id": task_id, "mapping": final_mapping, "start_time": start_time}
+            full_action = {"task_id": chosen_task_id, "mapping": final_mapping, "start_time": start_time}
             _, reward, terminated, _, info = env.step(full_action)
             # 累加指标
             if "num_swaps" in info:
@@ -360,8 +362,18 @@ def main():
             # 这是关键一步：我们将刚刚收到的中间奖励，
             # 平均分配或者全部归功于导致它的最后一个微观动作。
             # 将其归功于最后一个微观动作更简单且常用。  (中间的映射比特没有奖励，只是防止完一个任务才会有奖励)
+            # 将宏观奖励 reward 分配给导致它的最后一个微观动作和宏观动作
+            # --- 分配宏观奖励 ---
             if rollout_buffer["rewards"]:
-                rollout_buffer["rewards"][-1] += reward
+                # 将这个宏观奖励，公平地分配给产生它的所有步骤
+                # (1个宏观动作 + N_q个微观动作)
+                num_steps_for_this_task = 1 + num_logical_qubits
+                reward_per_step = reward / num_steps_for_this_task
+
+                # 为最近的 num_steps_for_this_task 步骤的奖励都加上这个平均值
+                for k in range(-num_steps_for_this_task, 0):
+                    if abs(k) <= len(rollout_buffer["rewards"]):
+                        rollout_buffer["rewards"][k] += reward_per_step
 
             if terminated:
                 break
@@ -379,12 +391,16 @@ def main():
             final_makespan = 0
 
         # --- 计算平均指标并写入TensorBoard ---
+        avg_size_priority = np.mean(episode_size_priority_scores) if episode_size_priority_scores else 0
+        avg_comm_priority = np.mean(episode_comm_priority_scores) if episode_comm_priority_scores else 0
         avg_swaps = np.mean(episode_swaps) if episode_swaps else 0
         avg_final_fidelity = np.mean(episode_fidelities) if episode_fidelities else 0
+        # 串扰平均
         avg_crosstalk = np.mean(episode_crosstalks) if episode_crosstalks else 0
-
         final_avg_fidelity = avg_final_fidelity
+        # 串扰总值
         final_total_crosstalk = np.sum(episode_crosstalks) if episode_crosstalks else 0
+
 
         # 将最新的结果存入滑动窗口
         recent_rewards.append(episode_reward_sum)
@@ -397,7 +413,9 @@ def main():
         episode_pbar.set_postfix({
             "Avg Reward (100)": f"{avg_reward:.2f}",
             "Avg Makespan (100)": f"{avg_makespan:.2f}",
-            "LR": f"{scheduler.get_last_lr()[0]:.1e}"
+            "LR": f"{scheduler.get_last_lr()[0]:.1e}",
+            "SizeP": f"{avg_size_priority:.2f}",  # Size Priority
+            "CommP": f"{avg_comm_priority:.2f}"  # Comm Priority
         })
 
         # 每隔N个episode，或者在训练结束时，画一张图
@@ -408,6 +426,8 @@ def main():
                 # 调用绘图函数并传入路径
                 plot_schedule(env.schedule_plan, args.CHIP_SIZE, baseline_makespan,plot_save_path)
         # --- 写入TensorBoard日志 ---
+        writer.add_scalar("strategy/size_priority_score", avg_size_priority, episode)
+        writer.add_scalar("strategy/communication_priority_score", avg_comm_priority, episode)
         writer.add_scalar("charts/makespan", final_makespan, episode)
         writer.add_scalar("charts/avg_fidelity", final_avg_fidelity, episode)
         writer.add_scalar("charts/total_crosstalk", final_total_crosstalk, episode)

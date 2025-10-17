@@ -89,7 +89,7 @@ class QuantumSchedulingEnv(gym.Env):
         self.observation_space = spaces.Dict({
             # 只保留与空间和时间最相关的特征
             "qubit_embeddings": spaces.Box(low=0.0, high=1.0, shape=(self.num_qubits, D_QUBIT), dtype=np.float32),
-            "current_task_embedding": spaces.Box(low=-1.0, high=1.0, shape=(D_TASK,), dtype=np.float32),
+            "task_embeddings": spaces.Box(low=-1.0, high=1.0, shape=(self.num_tasks, D_TASK), dtype=np.float32),
             "placement_mask": spaces.Box(low=0, high=1, shape=(self.num_qubits,), dtype=np.int8),
             "logical_qubit_context": spaces.Box(low=0, high=self.max_qubits_per_task, shape=(D_LOGICAL_CONTEXT,), dtype=np.float32)
         })
@@ -177,7 +177,9 @@ class QuantumSchedulingEnv(gym.Env):
         if max_val == min_val: return 0.0
         return 2 * (value - min_val) / (max_val - min_val) - 1
 
-    def _get_obs(self, current_task_id: int, placement_in_progress: Dict[int, Tuple[int, int]]) -> Dict:
+    def _get_obs(self,
+                 placement_in_progress: Dict[int, Tuple[int, int]] = None,
+                 task_for_placement: QuantumTask = None) -> Dict:
         """
         生成一个简化的、聚焦于时间和空间布局的观察。
         确保 task_embedding 的构建与 observation_space 的定义一致。
@@ -215,19 +217,29 @@ class QuantumSchedulingEnv(gym.Env):
 
             qubit_embeddings[idx] = qubit_features
 
-        # --- 2. 当前任务嵌入 (Current Task Embedding) ---
-        task = self.task_pool[current_task_id]
+        # --- 2. 任务池嵌入和掩码 (总是计算) ---
+        # 即使在放置阶段，我们也计算所有任务的信息，Transformer模型可以学会只关注需要的信息。
+        task_embeddings = np.zeros(self.observation_space["task_embeddings"].shape, dtype=np.float32)
+        task_mask = np.ones(self.num_tasks, dtype=np.int8)  # 1 = 非法/已调度
 
-        # a. 标量特征 (空间和时间需求)
-        num_q_norm = task.num_qubits / self.norm_factors['max_task_qubits']
-        duration_norm = task.estimated_duration / self.norm_factors['max_task_duration']
-        scalar_features = np.array([num_q_norm, duration_norm], dtype=np.float32)
+        for task_idx, task in self.task_pool.items():
+            # a. 标量特征
+            num_q_norm = task.num_qubits / self.norm_factors['max_task_qubits']
+            duration_norm = task.estimated_duration / self.norm_factors['max_task_duration']
+            scalar_features = np.array([num_q_norm, duration_norm], dtype=np.float32)
 
-        # b. 从任务对象中获取预计算好的GNN嵌入
-        graph_embedding = task.graph_embedding
+            # b. GNN嵌入
+            graph_embedding = task.graph_embedding
 
-        # c. 将标量特征和GNN嵌入拼接起来
-        task_embedding = np.concatenate([scalar_features, graph_embedding])
+            # c. 拼接
+            task_embedding_vector = np.concatenate([scalar_features, graph_embedding])
+
+            # 填充到总的任务嵌入张量中
+            task_embeddings[task_idx] = task_embedding_vector
+
+            # 如果任务未被调度，则在掩码中标记为合法 (0)
+            if not task.is_scheduled:
+                task_mask[task_idx] = 0
 
         # --- 3. 放置掩码 (Placement Mask) ---
         placement_mask = np.zeros(self.num_qubits, dtype=np.int8)
@@ -237,46 +249,43 @@ class QuantumSchedulingEnv(gym.Env):
 
         # --- 4. 当前逻辑比特上下文 (Logical Qubit Context) ---  placement_in_progress -> {0:(0,5) 1:(1,4)}
         # current_logical_idx 当前要放置的逻辑比特索引
-        current_logical_idx = len(placement_in_progress) if placement_in_progress else 0
-
-        # 已放置的邻居的物理坐标位置
-        avg_neighbor_x = 0.0
-        avg_neighbor_y = 0.0
+        # 默认值为0
+        current_logical_idx = 0
         connectivity_to_placed = 0
-        placed_neighbors_positions_list = []
+        norm_avg_x = 0.0
+        norm_avg_y = 0.0
 
-        if current_logical_idx < task.num_qubits and placement_in_progress:
-            graph = task.interaction_graph
-            for placed_logical_idx, placed_physical_id in placement_in_progress.items():
-                if graph.has_edge(current_logical_idx, placed_logical_idx):
-                    connectivity_to_placed += 1
-                    # 将物理坐标存入列表，用于后续计算
-                    placed_neighbors_positions_list.append(placed_physical_id)
+        if placement_in_progress is not None and task_for_placement is not None:
+            # 只有在放置阶段，才计算这些上下文信息
 
-        if connectivity_to_placed > 0:
-            # 计算所有已放置邻居的物理坐标的平均值（重心）
-            avg_neighbor_x = np.mean([pos[0] for pos in placed_neighbors_positions_list])
-            avg_neighbor_y = np.mean([pos[1] for pos in placed_neighbors_positions_list])
+            task = task_for_placement  # 使用传入的 task 对象
+            current_logical_idx = len(placement_in_progress)
 
-            # (可选) 计算标准差
-            # std_neighbor_x = np.std([pos[0] for pos in placed_neighbors_positions_list])
-            # std_neighbor_y = np.std([pos[1] for pos in placed_neighbors_positions_list])
+            placed_neighbors_positions_list = []
+            if current_logical_idx < task.num_qubits:
+                graph = task.interaction_graph
+                for placed_logical_idx, placed_physical_id in placement_in_progress.items():
+                    if graph.has_edge(current_logical_idx, placed_logical_idx):
+                        connectivity_to_placed += 1
+                        placed_neighbors_positions_list.append(placed_physical_id)
 
-        # 归一化
-        norm_avg_x = avg_neighbor_x / (self.chip_size[0] - 1) if self.chip_size[0] > 1 else 0
-        norm_avg_y = avg_neighbor_y / (self.chip_size[1] - 1) if self.chip_size[1] > 1 else 0
-
-        # 上下文向量，长度固定为4
+            if connectivity_to_placed > 0:
+                avg_neighbor_x = np.mean([pos[0] for pos in placed_neighbors_positions_list])
+                avg_neighbor_y = np.mean([pos[1] for pos in placed_neighbors_positions_list])
+                norm_avg_x = avg_neighbor_x / (self.chip_size[0] - 1) if self.chip_size[0] > 1 else 0
+                norm_avg_y = avg_neighbor_y / (self.chip_size[1] - 1) if self.chip_size[1] > 1 else 0
+        # 构建最终的上下文向量
         logical_qubit_context = np.array([
             current_logical_idx / self.max_qubits_per_task,
             connectivity_to_placed / self.max_qubits_per_task,
-            norm_avg_x,  # 邻居重心的X坐标
-            norm_avg_y  # 邻居重心的Y坐标
+            norm_avg_x,
+            norm_avg_y
         ], dtype=np.float32)
 
         return {
             "qubit_embeddings": qubit_embeddings,
-            "current_task_embedding": task_embedding,
+            "task_embeddings": task_embeddings,
+            "task_mask": task_mask,
             "placement_mask": placement_mask,
             "logical_qubit_context": logical_qubit_context
         }
@@ -329,7 +338,7 @@ class QuantumSchedulingEnv(gym.Env):
         initial_placement_in_progress = {}  # 空字典
 
         # 调用_get_obs并传递初始上下文
-        initial_obs = self._get_obs(initial_task_id, initial_placement_in_progress)
+        initial_obs = self._get_obs(placement_in_progress=None, task_for_placement=None)
 
         return initial_obs, {}
 
@@ -443,7 +452,7 @@ class QuantumSchedulingEnv(gym.Env):
         reward_fidelity = (final_fidelity - min_acceptable_fidelity) / (1.0 - min_acceptable_fidelity)
         reward_fidelity = np.clip(reward_fidelity, 0, 1.0)  # 裁剪到[0, 1]
 
-        # 4>. 串扰惩罚 (Crosstalk Penalty)
+        # 4>. 串扰惩罚 (Crosstalk Penalty)   mapping
         crosstalk_score = self._calculate_crosstalk(mapping, start_time, end_time)
         # 归一化并取负值
         penalty_crosstalk = -crosstalk_score * 5.0   # 粗略归一化
@@ -480,10 +489,9 @@ class QuantumSchedulingEnv(gym.Env):
 
         # ... 生成下一步观察并返回...
         if not terminated:
-            next_obs = self._get_obs(self.current_step, {})
+            next_obs = self._get_obs(placement_in_progress=None, task_for_placement=None)
         else:
-            last_task_id = self.num_tasks - 1
-            next_obs = self._get_obs(last_task_id, {})
+            next_obs = self._get_obs(placement_in_progress=None, task_for_placement=None)
 
         return next_obs, total_reward, terminated, False, info
 
@@ -497,7 +505,7 @@ class QuantumSchedulingEnv(gym.Env):
         # 占位符：计算与已调度任务的串扰
         score = 0.0
         for scheduled in self.schedule_plan:
-            # 检查时间重叠
+            # 检查时间重叠  例如：mapping {0: (3, 4), 1: (3, 3), 2: (4, 3), 3: (3, 2)}
             if max(start_time, scheduled['start_time']) < min(end_time, scheduled['end_time']):
                 # 检查物理邻接
                 for p_id1 in mapping.values():
