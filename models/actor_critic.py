@@ -1,4 +1,5 @@
 # 文件: models/actor_critic.py
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -71,7 +72,7 @@ class TransformerActorCritic(nn.Module):
         # Critic头：只依赖于全局特征
         self.critic_head = nn.Linear(128, 1)
 
-    def forward(self, obs: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, obs: dict) -> tuple[Any, Any, Any]:
         batch_size = obs["qubit_embeddings"].shape[0]
 
         # a. 将所有不同来源、不同维度的特征，通过线性层（nn.Linear）统一映射到 Transformer 能理解的维度 d_model (128)。

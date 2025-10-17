@@ -465,7 +465,10 @@ def update_ppo(model, optimizer, buffer, args, device, last_value, writer, globa
             next_non_terminal = 1.0 - buffer["dones"][t + 1]
             next_values = buffer["values"][t + 1]
 
-        delta = buffer["rewards"][t] + args.GAMMA * next_values * next_non_terminal - buffer["values"][t]
+        current_value_scalar = buffer["values"][t].item()
+        next_values_scalar = next_values.item()
+
+        delta = buffer["rewards"][t] + args.GAMMA * next_values_scalar * next_non_terminal - current_value_scalar
         advantages[t] = last_gae_lam = delta + args.GAMMA * args.GAE_LAMBDA * next_non_terminal * last_gae_lam
     returns = advantages + np.array(buffer["values"]).flatten()
 
@@ -494,7 +497,8 @@ def update_ppo(model, optimizer, buffer, args, device, last_value, writer, globa
             batch_returns = returns_t[batch_indices]
 
             # new_values: Critic网络对于小批量数据中的状态，做出的新预测。
-            logits, new_values = model(batch_obs)
+            task_logits, placement_logits, new_values = model(batch_obs)
+            logits = placement_logits
             new_probs = Categorical(logits=logits)
             # 更新网络时，新策略对同一个动作的打分
             new_log_probs = new_probs.log_prob(batch_actions)
