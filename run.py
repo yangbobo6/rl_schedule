@@ -27,13 +27,13 @@ class Hyperparameters:
     MAX_QUBITS_PER_TASK = 8  # 相应增加
 
     # --- PPO 训练参数 ---
-    LEARNING_RATE = 1e-4  # Transformer的稳定学习率
+    LEARNING_RATE = 3e-4  # Transformer的稳定学习率
     GAMMA = 0.99
     GAE_LAMBDA = 0.95
-    PPO_EPSILON = 0.2
-    CRITIC_DISCOUNT = 0.75  # 保持较高的Critic权重
-    ENTROPY_BETA = 0.01  # 可以从一个稍小的值开始，防止在长训练中过早停止探索
-    PPO_EPOCHS = 15  # 保持较高的PPO Epochs
+    PPO_EPSILON = 0.1
+    CRITIC_DISCOUNT = 1.0  # 保持较高的Critic权重
+    ENTROPY_BETA = 0.015  # 可以从一个稍小的值开始，防止在长训练中过早停止探索
+    PPO_EPOCHS = 20  # 保持较高的PPO Epochs
     ROLLOUT_LENGTH = 8192  # 充分利用GPU和内存，收集高质量数据
     MINI_BATCH_SIZE = 512  # 使用更大的批次以获得更稳定的梯度
 
@@ -53,7 +53,7 @@ class Hyperparameters:
         "swap": 1.5,       # swap次数
         "fidelity": 0.2,   # 保真度
         "crosstalk": 0.5,  # 串扰
-        "matching": 0.7    # 启发式奖励权重
+        "matching": 0.6    # 启发式奖励权重
     }
 
 
