@@ -159,7 +159,8 @@ def main():
     # PPO经验缓冲区
     rollout_buffer = {
         "obs": [], "actions": [], "log_probs": [], "rewards": [],
-        "dones": [], "values": []
+        "dones": [], "values": [],
+        "action_masks": [],  # 存储动作掩码，用于区分
     }
 
     # --- 训练循环 ---
@@ -177,7 +178,7 @@ def main():
         episode_comm_priority_scores = []
         initial_obs_dict, info = env.reset()
 
-        for chosen_task_id in range(env.num_tasks):
+        for task_count in range(env.num_tasks):
             # --------------------------------------------------
             # === 阶段一: 任务选择决策 ===
             # --------------------------------------------------
@@ -232,11 +233,14 @@ def main():
 
             # 4. 存储任务选择的经验 (这是第一个宏观步骤的经验)
             rollout_buffer["obs"].append(task_selection_obs_dict)
-            rollout_buffer["actions"].append(np.array([chosen_task_id]))  # 动作是任务ID
+            rollout_buffer["actions"].append(chosen_task_id_tensor.cpu().numpy())  # 动作是任务ID
             rollout_buffer["log_probs"].append(task_log_prob.cpu().numpy())
             rollout_buffer["values"].append(value_for_task_selection.cpu().numpy())
             rollout_buffer["rewards"].append(0)  # 奖励将在后面分配
             rollout_buffer["dones"].append(False)
+            # 为任务选择动作创建一个全True的掩码
+            is_task_selection_mask = torch.ones_like(chosen_task_id_tensor, dtype=torch.bool)
+            rollout_buffer["action_masks"].append(is_task_selection_mask.cpu().numpy())
 
             # --------------------------------------------------
             # === 阶段二: 放置决策 (微观循环) ===
@@ -326,11 +330,14 @@ def main():
 
                 # 3. 存储经验
                 rollout_buffer["obs"].append(placement_obs_dict)
-                rollout_buffer["actions"].append(placement_action_tensor.cpu().numpy())  # 动作是物理比特ID
+                rollout_buffer["actions"].append(placement_action_tensor.cpu().numpy())
                 rollout_buffer["log_probs"].append(placement_log_prob.cpu().numpy())
                 rollout_buffer["values"].append(value_for_placement.cpu().numpy())
                 rollout_buffer["rewards"].append(micro_reward)
                 rollout_buffer["dones"].append(False)
+                # 为放置动作创建一个全False的掩码
+                is_placement_mask = torch.zeros_like(placement_action_tensor, dtype=torch.bool)
+                rollout_buffer["action_masks"].append(is_placement_mask.cpu().numpy())
 
                 # 4. 更新进行中的放置
                 # 将action的下表（例如2）转换为qubit_id 例如(2,3)
@@ -456,6 +463,7 @@ def update_ppo(model, optimizer, buffer, args, device, last_value, writer, globa
     advantages = np.zeros(len(buffer["rewards"]), dtype=np.float32)
     last_gae_lam = 0
     last_value_np = last_value.cpu().detach().numpy().flatten()
+    action_masks_t = torch.tensor(np.array(buffer["action_masks"])).flatten().to(device)
 
     for t in reversed(range(len(buffer["rewards"]))):
         if t == len(buffer["rewards"]) - 1:
@@ -487,6 +495,8 @@ def update_ppo(model, optimizer, buffer, args, device, last_value, writer, globa
             end = start + args.MINI_BATCH_SIZE
             batch_indices = indices[start:end]
 
+            batch_action_masks = action_masks_t[batch_indices]
+
             # ... (提取小批量数据) ...
             batch_obs = {k: v[batch_indices] for k, v in obs_tensors.items()}
             batch_actions = actions_t[batch_indices]
@@ -498,11 +508,26 @@ def update_ppo(model, optimizer, buffer, args, device, last_value, writer, globa
 
             # new_values: Critic网络对于小批量数据中的状态，做出的新预测。
             task_logits, placement_logits, new_values = model(batch_obs)
-            logits = placement_logits
-            new_probs = Categorical(logits=logits)
-            # 更新网络时，新策略对同一个动作的打分
-            new_log_probs = new_probs.log_prob(batch_actions)
-            entropy = new_probs.entropy()
+
+            # 初始化log_probs和entropy
+            new_log_probs = torch.zeros_like(batch_log_probs_old)
+            entropy = torch.zeros_like(batch_log_probs_old)
+
+            # 1. 处理任务选择动作
+            task_indices = batch_action_masks
+            if task_indices.any():
+                task_probs = Categorical(logits=task_logits[task_indices])
+                new_log_probs[task_indices] = task_probs.log_prob(batch_actions[task_indices])
+                entropy[task_indices] = task_probs.entropy()
+
+            # 2. 处理放置动作
+            placement_indices = ~batch_action_masks
+            if placement_indices.any():
+                # 注意：这里的logits需要根据每个样本的final_mask来掩码，PPO实现通常更复杂
+                # 但我们先用简化的方式
+                placement_probs = Categorical(logits=placement_logits[placement_indices])
+                new_log_probs[placement_indices] = placement_probs.log_prob(batch_actions[placement_indices])
+                entropy[placement_indices] = placement_probs.entropy()
 
             # --- 计算Loss ---
             # 概率比率 衡量了新策略相对于旧策略，有多么“倾向于”做出我们当时实际做出的那个动作 a，ratio > 1: 新策略更喜欢这个动作
