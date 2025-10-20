@@ -1,8 +1,11 @@
+from collections import deque
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 import numpy as np
+from tqdm import tqdm
 
 # --- 1. 导入自定义模块 ---
 from environment import QuantumSchedulingEnv
@@ -44,6 +47,15 @@ class Hyperparameters:
     D_MODEL = 128
     N_HEAD = 4
     NUM_ENCODER_LAYERS = 3
+
+    # 奖励权重
+    REWARD_WEIGHTS = {
+        "compaction": 1.0, # 时间压缩
+        "swap": 1.5,       # swap次数
+        "fidelity": 0.2,   # 保真度
+        "crosstalk": 0.5,  # 串扰
+        "matching": 0.7    # 启发式奖励权重
+    }
 
 
 # --- 3. 定义Actor-Critic网络 ---
@@ -126,10 +138,15 @@ def main():
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    global_step = 0
+    # 用于计算平均性能的滑动窗口
+    recent_rewards = deque(maxlen=100)
+    recent_makespans = deque(maxlen=100)
 
     # 1. 初始化GNN模型
     gnn_model = GNNEncoder(
@@ -150,26 +167,27 @@ def main():
         max_qubits_per_task=args.MAX_QUBITS_PER_TASK,
         gnn_model=gnn_model,
         device=device,
-        gate_times=gate_times
+        gate_times=gate_times,
+        reward_weights=args.REWARD_WEIGHTS
     )
 
     # --- 保存芯片可视化图表 ---
     print("Generating and saving chip visualizations...")
     chip_viz_dir = f"{run_dir}/chip_visualization"
     os.makedirs(chip_viz_dir, exist_ok=True)
-    
+
     # 保存芯片总览图
     chip_overview_path = f"{chip_viz_dir}/chip_overview.png"
     env.visualize_chip(chip_overview_path, show_values=True)
-    
+
     # 保存连接矩阵
     connectivity_path = f"{chip_viz_dir}/connectivity_matrix.png"
     env.visualize_connectivity(connectivity_path)
-    
+
     # 导出芯片统计信息
     stats_path = f"{chip_viz_dir}/chip_stats.json"
     chip_stats = env.export_chip_stats(stats_path)
-    
+
     print(f"Chip visualizations saved to: {chip_viz_dir}")
     print(f"Chip stats: T1={chip_stats['avg_t1']:.2f}μs, T2={chip_stats['avg_t2']:.2f}μs, "
           f"Fidelity_1Q={chip_stats['avg_fidelity_1q']:.4f}")
@@ -203,14 +221,15 @@ def main():
     global_step = 0
     # 在main函数开始时，计算一个基线
     baseline_makespan = sum(t.estimated_duration for t in env.task_pool.values())
-    for episode in range(args.MAX_EPISODES):
+    episode_pbar = tqdm(range(args.MAX_EPISODES), desc="Training Progress")
+    for episode in episode_pbar:
+
         # --- 宏观循环: 调度一个完整的方案 ---
         # 在Episode开始前，记录一下最终的统计数据
         episode_reward_sum = 0.0  # 用于累加本episode的总奖励
-
-        final_makespan = 0
-        final_avg_fidelity = 0
-        final_total_crosstalk = 0
+        episode_swaps = []
+        episode_fidelities = []
+        episode_crosstalks = []
 
         initial_obs_dict, info = env.reset()
         episode_reward = 0
@@ -242,20 +261,74 @@ def main():
                     # Critic 输出的状态价值估计，表示当前状态预计能获得的未来回报
                     logits, value = model(obs_tensor)
 
-                # 应用掩码，防止选择已占用的比特
+                # 构建合法的动作掩码
+                # a. 获取已占用的比特掩码
+                # tensor([False, False, False, ...]),标记哪些物理比特已经被占用
                 placement_mask = torch.tensor(obs_dict["placement_mask"], dtype=torch.bool).to(device)
-                logits[0, placement_mask] = -1e8  # 将非法动作的logit设为极小值
+
+                # b. 获取连通性约束掩码,基于量子芯片的连通性约束来限制动作选择
+                connectivity_mask = torch.ones_like(placement_mask)  # 初始假设所有动作都非法
+                current_logical_idx = i
+                task_graph = current_task.interaction_graph
+
+                if i == 0:
+                    # 第一个比特可以放在任何未占用的地方
+                    connectivity_mask = placement_mask.clone()
+                else:
+                    valid_neighbors = set()
+                    # 检查当前逻辑比特 l_i 是否需要与任何已放置的比特 l_j 连接
+                    needs_connection = any(
+                        task_graph.has_edge(current_logical_idx, j) for j in placement_in_progress.keys())
+
+                    if not needs_connection:
+                        # 如果 l_i 与已放置的部分没有连接（例如，一个任务包含两个独立的组件）
+                        # 那么它可以放在任何未占用的地方
+                        connectivity_mask = placement_mask.clone()
+                    else:
+                        # 否则，它必须放在已放置邻居的空闲邻居位置
+                        for placed_logical_idx, placed_physical_id in placement_in_progress.items():
+                            if task_graph.has_edge(current_logical_idx, placed_logical_idx):
+                                for neighbor_id in env.chip_model[placed_physical_id].connectivity:
+                                    neighbor_idx = env.qubit_id_to_idx[neighbor_id]
+                                    if not placement_mask[neighbor_idx]:
+                                        valid_neighbors.add(neighbor_idx)
+
+                        if valid_neighbors:
+                            indices = torch.tensor(list(valid_neighbors), dtype=torch.long, device=device)
+                            connectivity_mask.scatter_(0, indices, 0)  # 将合法位置的掩码设为False
+                        else:
+                            # 如果所有邻居都被占用了，允许它放在任何未占用的地方，依赖奖励惩罚
+                            connectivity_mask = placement_mask.clone()
+
+                # c. 合并掩码
+                # 一个动作非法，当且仅当它已被占用 OR 它不满足连通性
+                final_mask = placement_mask | connectivity_mask
+                logits[0, final_mask] = -1e8  # 将非法动作的logit设为极小值
 
                 probs = Categorical(logits=logits) # PyTorch 的 Categorical 分布对象，把 logits 转换成概率分布
                 action = probs.sample()  # 采样一个动作 (物理比特的索引)
                 log_prob = probs.log_prob(action)
+
+                # --- 计算微观奖励 ---
+                micro_reward = 0
+                chosen_physical_id = env.idx_to_qubit_id[action.item()]
+
+                # 检查当前选择是否与已放置的邻居物理相连
+                for placed_logic_idx, placed_phys_id in placement_in_progress.items():
+                    if task_graph.has_edge(current_logical_idx, placed_logic_idx):
+                        if chosen_physical_id in env.chip_model[placed_phys_id].connectivity:
+                            micro_reward += 0.1
+                        else:
+                            # 如果硬约束生效，理论上不会走到这里。
+                            # 但如果硬约束被放宽（例如 valid_neighbors 为空时），这个惩罚就至关重要
+                            micro_reward -= 0.1
 
                 # 3. 存储经验
                 rollout_buffer["obs"].append(obs_dict)
                 rollout_buffer["actions"].append(action.cpu().numpy())
                 rollout_buffer["log_probs"].append(log_prob.cpu().numpy())
                 rollout_buffer["values"].append(value.cpu().numpy())
-                rollout_buffer["rewards"].append(0)  # 中间奖励为0
+                rollout_buffer["rewards"].append(micro_reward)
                 rollout_buffer["dones"].append(False)
 
                 # 4. 更新进行中的放置
@@ -275,7 +348,12 @@ def main():
                 start_time = max(env.chip_model[pid].get_next_available_time() for pid in final_mapping.values())
 
             full_action = {"task_id": task_id, "mapping": final_mapping, "start_time": start_time}
-            _, reward, terminated, _, _ = env.step(full_action)
+            _, reward, terminated, _, info = env.step(full_action)
+            # 累加指标
+            if "num_swaps" in info:
+                episode_swaps.append(info["num_swaps"])
+                episode_fidelities.append(info["final_fidelity"])
+                episode_crosstalks.append(info["crosstalk_score"])
             episode_reward_sum += reward  # 累加到episode总奖励
 
             # --- 将宏观步骤的奖励分配给微观步骤 ---
@@ -284,6 +362,9 @@ def main():
             # 将其归功于最后一个微观动作更简单且常用。  (中间的映射比特没有奖励，只是防止完一个任务才会有奖励)
             if rollout_buffer["rewards"]:
                 rollout_buffer["rewards"][-1] += reward
+
+            if terminated:
+                break
 
         # --- Episode 结束 ---
         # 此时episode_reward_sum就是TensorBoard中要记录的值
@@ -294,10 +375,30 @@ def main():
         # --- 计算并记录最终的调度方案指标 ---
         if env.schedule_plan:
             final_makespan = max(t['end_time'] for t in env.schedule_plan)
-            # fidelities = [t['fidelity'] for t in env.schedule_plan]
-            # final_avg_fidelity = np.prod(fidelities) ** (1 / len(fidelities)) if fidelities else 0
-            # final_total_crosstalk = sum(t['crosstalk'] for t in env.schedule_plan)
+        else:
+            final_makespan = 0
 
+        # --- 计算平均指标并写入TensorBoard ---
+        avg_swaps = np.mean(episode_swaps) if episode_swaps else 0
+        avg_final_fidelity = np.mean(episode_fidelities) if episode_fidelities else 0
+        avg_crosstalk = np.mean(episode_crosstalks) if episode_crosstalks else 0
+
+        final_avg_fidelity = avg_final_fidelity
+        final_total_crosstalk = np.sum(episode_crosstalks) if episode_crosstalks else 0
+
+        # 将最新的结果存入滑动窗口
+        recent_rewards.append(episode_reward_sum)
+        recent_makespans.append(final_makespan)
+
+        # 使用 set_postfix 更新进度条的显示信息
+        avg_reward = np.mean(recent_rewards) if recent_rewards else 0.0
+        avg_makespan = np.mean(recent_makespans) if recent_makespans else 0.0
+
+        episode_pbar.set_postfix({
+            "Avg Reward (100)": f"{avg_reward:.2f}",
+            "Avg Makespan (100)": f"{avg_makespan:.2f}",
+            "LR": f"{scheduler.get_last_lr()[0]:.1e}"
+        })
 
         # 每隔N个episode，或者在训练结束时，画一张图
         if episode % 50 == 0 or episode == args.MAX_EPISODES - 1:
@@ -311,12 +412,17 @@ def main():
         writer.add_scalar("charts/avg_fidelity", final_avg_fidelity, episode)
         writer.add_scalar("charts/total_crosstalk", final_total_crosstalk, episode)
         writer.add_scalar("charts/learning_rate", args.LEARNING_RATE, episode)  # 记录学习率
+
+        writer.add_scalar("physics/avg_swaps_per_task", avg_swaps, episode)
+        writer.add_scalar("physics/avg_task_fidelity", avg_final_fidelity, episode)
+        writer.add_scalar("physics/avg_crosstalk_per_task", avg_crosstalk, episode)
         # 在update_ppo函数中，我们也可以记录loss
         # writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
         # ...
-        env.render()
+        # env.render()
         scheduler.step()
 
+    episode_pbar.close()
     # 关闭writer
     writer.close()
     print("Training finished.")
