@@ -90,6 +90,7 @@ class QuantumSchedulingEnv(gym.Env):
             # 只保留与空间和时间最相关的特征
             "qubit_embeddings": spaces.Box(low=0.0, high=1.0, shape=(self.num_qubits, D_QUBIT), dtype=np.float32),
             "task_embeddings": spaces.Box(low=-1.0, high=1.0, shape=(self.num_tasks, D_TASK), dtype=np.float32),
+            "task_mask": spaces.Box(low=0, high=1, shape=(self.num_tasks,), dtype=np.int8),
             "placement_mask": spaces.Box(low=0, high=1, shape=(self.num_qubits,), dtype=np.int8),
             "logical_qubit_context": spaces.Box(low=0, high=self.max_qubits_per_task, shape=(D_LOGICAL_CONTEXT,), dtype=np.float32)
         })
