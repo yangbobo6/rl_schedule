@@ -8,6 +8,9 @@ from models.quantum_task import QuantumTask
 from task_generate import TaskGenerator
 from chip_visualizer import QuantumChipVisualizer
 
+from torch_geometric.data import Data
+from models.gnn_encoder import networkx_to_pyg_data
+import torch
 
 class QuantumSchedulingEnv(gym.Env):
     """
@@ -35,7 +38,8 @@ class QuantumSchedulingEnv(gym.Env):
         # --- 核心数据结构 ---
         self.task_generator = TaskGenerator(gate_times, gnn_model, device)
         self.chip_model: Dict[Tuple[int, int], PhysicalQubit] = self._create_chip_model()
-        self.task_pool: Dict[int, QuantumTask] = self._create_task_pool()
+        # self.task_pool: Dict[int, QuantumTask] = self._create_task_pool()
+        self.task_pool = self.task_generator.build_large_task_pool(num_tasks=100)
         self.schedule_plan: List[Dict] = []
         self.current_step = 0
         # 简化版SWAP估算器：假设每个SWAP门增加固定的时间和错误
@@ -93,6 +97,33 @@ class QuantumSchedulingEnv(gym.Env):
             "placement_mask": spaces.Box(low=0, high=1, shape=(self.num_qubits,), dtype=np.int8),
             "logical_qubit_context": spaces.Box(low=0, high=self.max_qubits_per_task, shape=(D_LOGICAL_CONTEXT,), dtype=np.float32)
         })
+
+    def get_candidate_tasks(self) -> list:
+        """返回所有当前未被调度的任务对象列表。"""
+        return [task for task in self.task_pool.values() if not task.is_scheduled]
+
+    def get_chip_state_graph_data(self) -> Data:
+        """
+        将当前芯片的状态（特别是比特的占用情况）编码为一个PyG的Data对象。
+        """
+        # 我们使用比特是否被占用 (1 or 0) 作为简单的节点特征
+        # 也可以加入 next_available_time 等更丰富的特征
+        placement_mask = np.zeros(self.num_qubits, dtype=np.int8)
+        for i, qid in enumerate(self.idx_to_qubit_id.values()):
+            if self.chip_model[qid].get_next_available_time() > 0:  # 粗略判断是否被占用
+                placement_mask[i] = 1
+
+        node_features = torch.tensor(placement_mask, dtype=torch.float32).unsqueeze(1)
+
+        # 芯片的边索引是固定的，可以在__init__中预计算以提高效率
+        if not hasattr(self, '_chip_edge_index'):
+            edge_index_list = []
+            for qid, q in self.chip_model.items():
+                for neighbor_id in q.connectivity:
+                    edge_index_list.append([self.qubit_id_to_idx[qid], self.qubit_id_to_idx[neighbor_id]])
+            self._chip_edge_index = torch.tensor(edge_index_list, dtype=torch.long).t().contiguous()
+
+        return Data(x=node_features, edge_index=self._chip_edge_index)
 
     def _create_chip_model(self) -> Dict[Tuple[int, int], PhysicalQubit]:
         """创建并初始化芯片模型，包括模拟的物理属性"""
@@ -308,7 +339,7 @@ class QuantumSchedulingEnv(gym.Env):
 
     def reset(self, seed=None, options=None) -> Tuple[Dict, Dict]:
         """
-        重置环境到初始状态，并为第一个任务生成一个合法的初始观察。
+        重置环境，并动态地选择一个初始任务来生成合法的初始观察。
         """
         super().reset(seed=seed)
 
@@ -322,19 +353,25 @@ class QuantumSchedulingEnv(gym.Env):
 
         self.current_step = 0
         self.schedule_plan = []
-        for task in self.task_pool.values():
-            task.reset()
         for qubit in self.chip_model.values():
             qubit.reset()
 
-        # --- 关键修改处 ---
-        # 在reset时，我们总是准备为第一个任务（ID为0）开始调度。
-        # 因此，我们可以为它生成一个初始观察。
-        # 此时，还没有任何比特被放置。
-        initial_task_id = 0
-        initial_placement_in_progress = {}  # 空字典
+        # 2. 重新生成当次Episode的任务池，并动态选择初始任务
+        # 从大任务池中随机采样新的一组任务
+        self.task_pool = self.task_generator.get_episode_tasks(self.num_tasks)
 
-        # 调用_get_obs并传递初始上下文
+        # 重置新任务池中所有任务的状态
+        for task in self.task_pool.values():
+            task.reset()
+
+        # 动态地、确定性地选择一个初始任务ID
+        # 例如，选择当前任务池中ID最小的那个任务
+        if not self.task_pool:
+            raise ValueError("Task pool is empty after reset.")
+        initial_task_id = sorted(self.task_pool.keys())[0]
+
+        # 3. 生成初始观察
+        initial_placement_in_progress = {}
         initial_obs = self._get_obs(initial_task_id, initial_placement_in_progress)
 
         return initial_obs, {}
@@ -484,13 +521,29 @@ class QuantumSchedulingEnv(gym.Env):
             self.chip_model[physical_q_id].booking_schedule.append((action["start_time"], end_time))
             self.chip_model[physical_q_id].booking_schedule.sort()
 
-        # ... 生成下一步观察并返回...
+        terminated = (self.current_step == self.num_tasks)
+
         if not terminated:
-            next_obs = self._get_obs(self.current_step, {})
+            # 如果还有任务，我们需要找到一个合法的、未被调度的任务ID来生成观察。
+            # 我们可以简单地选择当前剩余任务中ID最小的那个。
+            candidate_tasks = self.get_candidate_tasks()
+            if not candidate_tasks:
+                # 理论上不应发生，但作为保护
+                # 如果没有候选任务了，说明实际上已经终止
+                terminated = True
+                # 使用最后一个被调度的任务ID作为占位符
+                next_task_id = action["task_id"]
+            else:
+                next_task_id = sorted([task.id for task in candidate_tasks])[0]
+
+            # 为这个合法的下一个任务生成初始观察
+            next_obs = self._get_obs(next_task_id, {})
         else:
-            last_task_id = self.num_tasks - 1
+            # 如果所有任务都完成了，就用最后一个被调度的任务ID作为占位符
+            last_task_id = action["task_id"]
             next_obs = self._get_obs(last_task_id, {})
 
+        # ... (返回 total_reward, info 等) ...
         return next_obs, total_reward, terminated, False, info
 
     def _estimate_fidelity(self, task: QuantumTask, mapping: Dict) -> float:
