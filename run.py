@@ -5,12 +5,13 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 import numpy as np
+from torch_geometric.data import Batch
 from tqdm import tqdm
 
 # --- 1. 导入自定义模块 ---
 from environment import QuantumSchedulingEnv
 from models.actor_critic import CNNActorCritic, TransformerActorCritic
-from models.gnn_encoder import GNNEncoder
+from models.gnn_encoder import GNNEncoder, networkx_to_pyg_data
 from models.quantum_task import QuantumTask  # 确保__init__.py工作正常
 from torch.utils.tensorboard import SummaryWriter # 导入TensorBoard的Writer
 import time
@@ -20,23 +21,23 @@ from visualizer import plot_schedule # 导入我们的绘图函数
 # --- 2. 定义超参数 ---
 class Hyperparameters:
     # --- 训练过程参数 ---
-    MAX_EPISODES = 20000  # 增加训练总轮数
+    MAX_EPISODES = 50000  # 增加训练总轮数
 
     # --- 环境参数 ---
     CHIP_SIZE = (6, 6)  # 挑战更大的芯片
     NUM_TASKS = 20  # 挑战更多的任务
-    MAX_QUBITS_PER_TASK = 8  # 相应增加
+    MAX_QUBITS_PER_TASK = 10  # 相应增加
 
     # --- PPO 训练参数 ---
     LEARNING_RATE = 1e-4  # Transformer的稳定学习率
     GAMMA = 0.99
     GAE_LAMBDA = 0.95
     PPO_EPSILON = 0.2
-    CRITIC_DISCOUNT = 0.75  # 保持较高的Critic权重
+    CRITIC_DISCOUNT = 1  # 保持较高的Critic权重
     ENTROPY_BETA = 0.01  # 可以从一个稍小的值开始，防止在长训练中过早停止探索
-    PPO_EPOCHS = 15  # 保持较高的PPO Epochs
-    ROLLOUT_LENGTH = 8192  # 充分利用GPU和内存，收集高质量数据
-    MINI_BATCH_SIZE = 512  # 使用更大的批次以获得更稳定的梯度
+    PPO_EPOCHS = 10  # 保持较高的PPO Epochs
+    ROLLOUT_LENGTH = 16384  # 充分利用GPU和内存，收集高质量数据
+    MINI_BATCH_SIZE = 1024  # 使用更大的批次以获得更稳定的梯度
 
     # --- GNN参数 ---
     GNN_NODE_DIM = 1
@@ -52,9 +53,9 @@ class Hyperparameters:
     REWARD_WEIGHTS = {
         "compaction": 1.0, # 时间压缩
         "swap": 1.5,       # swap次数
-        "fidelity": 0.2,   # 保真度
-        "crosstalk": 0.5,  # 串扰
-        "matching": 0.7    # 启发式奖励权重
+        "fidelity": 0.5,   # 保真度
+        "crosstalk": 0.7,  # 串扰
+        "matching": 0.6    # 启发式奖励权重
     }
 
 
@@ -112,6 +113,8 @@ class ActorCritic(nn.Module):
         return action_logits, state_value
 
 
+from models.selector import SiameseGNNSelector
+
 # --- 4. 主函数 ---
 def main():
 
@@ -155,6 +158,21 @@ def main():
         output_dim=args.GNN_OUTPUT_DIM
     ).to(device)
     gnn_model.eval()  # 我们只用它来编码，不训练
+
+    # b. GNN选择器 (用于任务选择)
+    print("Loading pre-trained GNN Selector...")
+    gnn_selector = SiameseGNNSelector(
+        chip_node_dim=1, task_node_dim=1,  # 节点特征维度
+        hidden_dim=64, embed_dim=32
+    ).to(device)
+    try:
+        gnn_selector.load_state_dict(torch.load("models/gnn_selector_v0.pth", map_location=device))
+    except FileNotFoundError:
+        print("Warning: GNN Selector model not found. Task selection will be random.")
+        gnn_selector = None  # 如果找不到模型，则退化为随机选择
+    if gnn_selector:
+        gnn_selector.eval()
+
 
     gate_times = {
         'u3': 50, 'u': 50, 'p': 30, 'cx': 350, 'id': 30,
@@ -235,6 +253,32 @@ def main():
         episode_reward = 0
 
         for task_id in range(env.num_tasks):
+            # === 1. 任务选择决策 (由GNN完成) ===
+            candidate_tasks = env.get_candidate_tasks()
+            if not candidate_tasks: break  # 如果没有可选任务，提前结束
+
+            if gnn_selector:
+                chip_graph_data = env.get_chip_state_graph_data()
+                task_graph_data_list = [networkx_to_pyg_data(t.interaction_graph) for t in candidate_tasks]
+
+                scores = []
+                with torch.no_grad():
+                    # 为了高效，我们将所有候选任务打包成一个batch进行预测
+                    chip_batch = Batch.from_data_list([chip_graph_data] * len(candidate_tasks)).to(device)
+                    task_batch = Batch.from_data_list(task_graph_data_list).to(device)
+
+                    scores = gnn_selector(chip_batch, task_batch).cpu().numpy().flatten()
+
+                # 选择分数最高的任务
+                chosen_task_local_index = np.argmax(scores)
+                chosen_task = candidate_tasks[chosen_task_local_index]
+                task_id = chosen_task.id
+            else:
+                # 如果没有GNN选择器，则随机选择一个
+                chosen_task = np.random.choice(candidate_tasks)
+                task_id = chosen_task.id
+
+            # === 2. 任务放置决策 (由RL完成) ===
             current_task = env.task_pool[task_id]
             num_logical_qubits = current_task.num_qubits
             placement_in_progress = {}

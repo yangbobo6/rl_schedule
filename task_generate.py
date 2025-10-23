@@ -37,12 +37,22 @@ class TaskGenerator:
         self.basis_gates = list(gate_times.keys())
         self.gnn_model = gnn_model
         self.device = device
-        self.large_task_pool = self.generate_tasks(100)  # 一次性生成100个不同的任务
+        self.large_task_pool = None # 初始化为None
+
+    def build_large_task_pool(self, num_tasks=100):
+        """一个独立的方法，用于生成大任务池"""
+        if self.large_task_pool is None:
+            self.large_task_pool = self.generate_tasks(num_tasks)
+        return self.large_task_pool
 
     def get_episode_tasks(self, num_tasks: int) -> dict:
         # 从大池中随机采样
+        if self.large_task_pool is None:
+            self.build_large_task_pool()
+
         sampled_ids = np.random.choice(list(self.large_task_pool.keys()), num_tasks, replace=False)
-        episode_tasks = {i: self.large_task_pool[tid] for i, tid in enumerate(sampled_ids)}
+        # 使用原始ID作为新task_pool的键
+        episode_tasks = {tid: self.large_task_pool[tid] for tid in sampled_ids}
         return episode_tasks
 
 
