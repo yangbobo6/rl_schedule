@@ -421,7 +421,8 @@ class QuantumSchedulingEnv(gym.Env):
             "start_time": action["start_time"], "end_time": end_time
         }]
 
-        # 2.5. 对当前任务的逻辑比特按度数从高到低排序
+        # 5. 匹配度
+        # 对当前任务的逻辑比特按度数从高到低排序
         graph = task.interaction_graph
         # graph.degree返回的是 (node, degree) 的元组列表
         sorted_logical_qubits = sorted(graph.degree, key=lambda x: x[1], reverse=True)
@@ -567,7 +568,7 @@ class QuantumSchedulingEnv(gym.Env):
 
     def _calculate_final_reward(self) -> float:
         """
-        【已修改】只关注时间奖励。
+        只关注时间奖励。
         """
         if not self.schedule_plan:
             return -10.0

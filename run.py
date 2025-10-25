@@ -458,12 +458,27 @@ def main():
         writer.add_scalar("charts/makespan", final_makespan, episode)
         writer.add_scalar("charts/avg_fidelity", final_avg_fidelity, episode)
         writer.add_scalar("charts/total_crosstalk", final_total_crosstalk, episode)
-        writer.add_scalar("charts/learning_rate", args.LEARNING_RATE, episode)  # 记录学习率
+        writer.add_scalar("hyperparameters/learning_rate", scheduler.get_last_lr()[0], episode)
 
         writer.add_scalar("physics/avg_swaps_per_task", avg_swaps, episode)
         writer.add_scalar("physics/avg_task_fidelity", avg_final_fidelity, episode)
         writer.add_scalar("physics/avg_crosstalk_per_task", avg_crosstalk, episode)
 
+        # 每隔N个episode，或者在训练结束时，画一张图
+        if episode % 200 == 0 or episode == args.MAX_EPISODES - 1:
+            # a. 保存调度图
+            if env.schedule_plan:
+                plot_save_path = os.path.join(plots_dir, f"schedule_episode_{episode}.png")
+                plot_schedule(env.schedule_plan, args.CHIP_SIZE, baseline_makespan, save_path=plot_save_path)
+
+            # b. 保存模型权重
+            checkpoint_path = os.path.join(checkpoints_dir, f"model_episode_{episode}.pth")
+            torch.save(model.state_dict(), checkpoint_path)
+
+            # 在tqdm进度条上打印一条清晰的保存信息
+            episode_pbar.write(f"--- Checkpoint saved to {checkpoint_path} at episode {episode} ---")
+
+        # 4. 在每个Episode结束时更新学习率
         scheduler.step()
 
         # =====================================================================
