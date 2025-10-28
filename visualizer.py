@@ -93,3 +93,81 @@ def plot_schedule(schedule_plan: list,
         plt.show()  # 如果没有提供路径，则显示图像
 
     plt.close(fig)  # 关闭图形对象，释放内存，这一点非常重要！
+
+
+def plot_comparison(rl_plan: list, qumc_plan: list, chip_size: tuple, save_path: str = None):
+    """
+    在两个子图上并排绘制RL和QuMC的调度方案以进行对比。
+    """
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(20, 16), sharex=False)
+    fig.suptitle('Scheduler Comparison: Reinforcement Learning vs. QuMC Heuristic', fontsize=20)
+
+    plans = [rl_plan, qumc_plan]
+    axes = [ax1, ax2]
+    titles = ["RL Scheduler", "QuMC-style Heuristic"]
+    colors = ['r', 'b']
+
+    max_makespan = 0
+
+    for i, plan in enumerate(plans):
+        ax = axes[i]
+        title = titles[i]
+
+        num_qubits = chip_size[0] * chip_size[1]
+        ax.set_ylim(-0.5, num_qubits - 0.5)
+        ax.set_yticks(np.arange(num_qubits))
+        ax.set_yticklabels([f"Q({r},{c})" for r in range(chip_size[0]) for c in range(chip_size[1])])
+        ax.set_ylabel("Physical Qubit")
+        ax.set_title(title, fontsize=14)
+        ax.grid(axis='x', linestyle=':', alpha=0.7)
+
+        if not plan: continue
+
+        task_ids = sorted(list(set(item['task_id'] for item in plan)))
+        cmap = plt.cm.get_cmap('viridis', len(task_ids)) if task_ids else plt.cm.get_cmap('viridis')
+        task_colors = {tid: cmap(j / len(task_ids)) for j, tid in enumerate(task_ids)} if task_ids else {}
+
+        qubit_map = {(r, c): r * chip_size[1] + c for r in range(chip_size[0]) for c in range(chip_size[1])}
+
+        for item in plan:
+            task_id = item['task_id']
+            start_time = item['start_time']
+            duration = item['end_time'] - start_time
+
+            if 'mapping' in item and item['mapping']:
+                for physical_id in item['mapping'].values():
+                    y_pos = qubit_map.get(physical_id)
+                    if y_pos is not None:
+                        rect = Rectangle(
+                            (start_time, y_pos - 0.4), duration, 0.8,
+                            facecolor=task_colors.get(task_id, 'gray'), edgecolor='black', alpha=0.8, linewidth=0.5
+                        )
+                        ax.add_patch(rect)
+                        if duration > 0:
+                            ax.text(start_time + duration / 2, y_pos, f"T{task_id}",
+                                    ha='center', va='center', color='white', weight='bold', fontsize=8)
+
+        current_makespan = max(item['end_time'] for item in plan) if plan else 0
+        if current_makespan > max_makespan:
+            max_makespan = current_makespan
+
+        ax.axvline(x=current_makespan, color=colors[i], linestyle='--', linewidth=2,
+                   label=f'Makespan: {current_makespan:.2f} us')
+        ax.legend()
+
+    ax1.set_xlim(0, max_makespan * 1.1)
+    ax2.set_xlim(0, max_makespan * 1.1)
+    ax2.set_xlabel("Time (us)", fontsize=12)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    if save_path:
+        directory = os.path.dirname(save_path)
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+        plt.savefig(save_path, dpi=200)
+        print(f"Comparison plot saved to {save_path}")
+    else:
+        plt.show()
+
+    plt.close(fig)

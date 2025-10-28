@@ -391,28 +391,39 @@ class QuantumSchedulingEnv(gym.Env):
             makespan_before = max(t['end_time'] for t in self.schedule_plan)
         idle_volume_before = self._calculate_idle_volume(self.schedule_plan, makespan_before)
 
-        # --- 2. 正常执行动作 ---
+        # --- 2. 解析动作并获取任务对象 ---
         task_id = action["task_id"]
         task = self.task_pool[task_id]
         start_time = action["start_time"]
         mapping = action["mapping"]
 
-        # --- 在执行前，估算SWAP和保真度 ---
-        num_swaps, final_fidelity = self._estimate_swaps_and_fidelity(task, mapping)
+        # --- 3. 计算所有物理相关的指标 ---
+        # a. 估算SWAP和基础保真度
+        num_swaps, base_fidelity = self._estimate_swaps_and_fidelity(task, mapping)
 
-        # 因SWAP而增加的额外时长
+        # b. 计算因SWAP增加的额外时长
         duration_penalty_swap = num_swaps * self.swap_penalty["duration"] / 1e3  # us
 
-        task.is_scheduled = True
-        self.current_step += 1
-        duration = task.estimated_duration + duration_penalty_swap  # 总时长=估算+包含SWAP
+        # c. 计算任务最终的总时长和结束时间
+        duration = task.estimated_duration + duration_penalty_swap
         end_time = start_time + duration
 
+        # d. 计算与已存在任务的串扰
+        crosstalk_score = self._calculate_crosstalk(mapping, start_time, end_time)
+
         # 创建一个临时的、更新后的调度计划来计算新状态
-        next_schedule_plan = self.schedule_plan + [{
-            "task_id": task_id, "mapping": action["mapping"],
-            "start_time": action["start_time"], "end_time": end_time
-        }]
+
+        schedule_item = {
+            "task_id": task_id,
+            "mapping": mapping,
+            "start_time": start_time,
+            "end_time": end_time,
+            "num_swaps": num_swaps,
+            "final_fidelity": base_fidelity,
+            "crosstalk_score": crosstalk_score
+        }
+
+        next_schedule_plan = self.schedule_plan + [schedule_item]
 
         # 5. 匹配度
         # 对当前任务的逻辑比特按度数从高到低排序
@@ -477,11 +488,10 @@ class QuantumSchedulingEnv(gym.Env):
         # 3>. 保真度奖励 (Fidelity Reward)
         # 保真度本身就在[0,1]区间，是一个很好的奖励
         min_acceptable_fidelity = 0.80
-        reward_fidelity = (final_fidelity - min_acceptable_fidelity) / (1.0 - min_acceptable_fidelity)
+        reward_fidelity = (base_fidelity - min_acceptable_fidelity) / (1.0 - min_acceptable_fidelity)
         reward_fidelity = np.clip(reward_fidelity, 0, 1.0)  # 裁剪到[0, 1]
 
         # 4>. 串扰惩罚 (Crosstalk Penalty)
-        crosstalk_score = self._calculate_crosstalk(mapping, start_time, end_time)
         # 归一化并取负值
         penalty_crosstalk = -crosstalk_score * 5.0   # 粗略归一化
 
@@ -503,13 +513,11 @@ class QuantumSchedulingEnv(gym.Env):
 
         total_reward = intermediate_reward + final_reward_bonus
 
-        info = {
-            "num_swaps": num_swaps,
-            "final_fidelity": final_fidelity,
-            "crosstalk_score": crosstalk_score
-        }
+        info = schedule_item
 
         # --- 4. 更新真实的环境状态 ---
+        task.is_scheduled = True
+        self.current_step += 1
         self.schedule_plan = next_schedule_plan
         for physical_q_id in action["mapping"].values():
             self.chip_model[physical_q_id].booking_schedule.append((action["start_time"], end_time))
