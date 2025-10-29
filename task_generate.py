@@ -37,13 +37,49 @@ class TaskGenerator:
         self.basis_gates = list(gate_times.keys())
         self.gnn_model = gnn_model
         self.device = device
-        self.large_task_pool = self.generate_tasks(100)  # 一次性生成100个不同的任务
+        # 创建严格分离的任务池
+        print("Generating separate task pools for train, validation, and test...")
+        self.train_pool = self._generate_specific_tasks(2000)  # 大量的训练任务
+        self.validation_pool = self._generate_specific_tasks(200)  # 用于调整超参数
+        self.test_pool = self._generate_specific_tasks(200)  # 用于最终的、一锤定音的性能评估
 
-    def get_episode_tasks(self, num_tasks: int) -> dict:
+    def get_episode_tasks(self, num_tasks: int, pool: str = 'train') -> dict:
         # 从大池中随机采样
-        sampled_ids = np.random.choice(list(self.large_task_pool.keys()), num_tasks, replace=False)
-        episode_tasks = {i: self.large_task_pool[tid] for i, tid in enumerate(sampled_ids)}
+        """
+                从指定的池中随机采样任务。
+
+                Args:
+                    num_tasks (int): 要采样的任务数量。
+                    pool (str): 'train', 'validation', or 'test'.
+                """
+        source_pool = None
+        if pool == 'train':
+            source_pool = self.train_pool
+        elif pool == 'validation':
+            source_pool = self.validation_pool
+        elif pool == 'test':
+            source_pool = self.test_pool
+        else:
+            raise ValueError("Pool must be 'train', 'validation', or 'test'.")
+
+        # 从指定池中随机采样
+        source_keys = list(source_pool.keys())
+        sampled_ids = np.random.choice(source_keys, num_tasks, replace=False)
+        episode_tasks = {i: source_pool[tid] for i, tid in enumerate(sampled_ids)}
         return episode_tasks
+
+    def _generate_specific_tasks(self, num_to_generate: int) -> dict:
+        """一个辅助函数，用于生成指定数量的任务，避免与旧方法混淆"""
+        # 这个方法的内容与您之前的 generate_tasks 基本相同
+        tasks = {}
+        for i in range(num_to_generate):
+            # 确保每次生成的任务都有独一无二的属性
+            # 可以通过增大随机范围或使用不同的随机种子来实现
+            num_qubits = np.random.randint(3, 8)  # 增加任务多样性
+            circuit = self._create_dummy_circuit(num_qubits)
+            task = self._parse_circuit(i, circuit)
+            tasks[i] = task
+        return tasks
 
 
     def generate_tasks(self, num_tasks: int) -> dict:
@@ -144,7 +180,7 @@ class TaskGenerator:
     def _create_dummy_circuit(self, num_qubits: int) -> QuantumCircuit:
         """一个备用的虚拟线路生成器"""
         qc = QuantumCircuit(num_qubits)
-        depth = np.random.randint(5, 15)
+        depth = np.random.randint(5, 25)
         for _ in range(depth):
             for i in range(num_qubits):
                 if np.random.rand() > 0.5:

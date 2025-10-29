@@ -312,7 +312,13 @@ class QuantumSchedulingEnv(gym.Env):
         """
         super().reset(seed=seed)
 
-        self.task_pool = self.task_generator.get_episode_tasks(self.num_tasks)
+        # 根据options选择任务池
+        pool_name = 'train'
+        if options and 'pool' in options:
+            pool_name = options['pool']
+
+        # 调用TaskGenerator从指定池中获取任务
+        self.task_pool = self.task_generator.get_episode_tasks(self.num_tasks, pool=pool_name)
 
         self.current_step = 0
         self.schedule_plan = []

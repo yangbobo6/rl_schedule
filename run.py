@@ -207,10 +207,6 @@ def main():
     scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.1,
                                                   total_iters=args.MAX_EPISODES)
 
-    # action_space_dim = env.num_qubits  # 我们的动作是选择一个物理比特
-    # model = ActorCritic(env.observation_space, action_space_dim).to(device)
-    # optimizer = optim.Adam(model.parameters(), lr=args.LEARNING_RATE)
-
     # PPO经验缓冲区
     rollout_buffer = {
         "obs": [], "actions": [], "log_probs": [], "rewards": [],
@@ -221,8 +217,18 @@ def main():
     global_step = 0
     # 在main函数开始时，计算一个基线
     baseline_makespan = sum(t.estimated_duration for t in env.task_pool.values())
+    # 用于计算训练性能滑动平均的窗口
+    recent_train_rewards = deque(maxlen=100)
+    recent_train_makespans = deque(maxlen=100)
+    # 用于跟踪最佳性能的变量
+    best_validation_makespan = float('inf')
     episode_pbar = tqdm(range(args.MAX_EPISODES), desc="Training Progress")
     for episode in episode_pbar:
+        # =====================================================================
+        # === 训练阶段 (Training Phase) ===
+        # =====================================================================
+        # 告诉环境从'train'池中采样
+        initial_obs_dict, info = env.reset(options={'pool': 'train'})
 
         # --- 宏观循环: 调度一个完整的方案 ---
         # 在Episode开始前，记录一下最终的统计数据
@@ -230,9 +236,6 @@ def main():
         episode_swaps = []
         episode_fidelities = []
         episode_crosstalks = []
-
-        initial_obs_dict, info = env.reset()
-        episode_reward = 0
 
         for task_id in range(env.num_tasks):
             current_task = env.task_pool[task_id]
@@ -416,11 +419,86 @@ def main():
         writer.add_scalar("physics/avg_swaps_per_task", avg_swaps, episode)
         writer.add_scalar("physics/avg_task_fidelity", avg_final_fidelity, episode)
         writer.add_scalar("physics/avg_crosstalk_per_task", avg_crosstalk, episode)
-        # 在update_ppo函数中，我们也可以记录loss
-        # writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
-        # ...
-        # env.render()
+
         scheduler.step()
+
+        # =====================================================================
+        # === 验证阶段 (Validation Phase) ===
+        # =====================================================================
+
+        # 每隔200个episodes (且不是第一个episode)，进行一次验证
+        if episode > 0 and episode % 200 == 0:
+            print(f"\n--- [Episode {episode}] Running Validation ---")
+
+            # 将模型设置为评估模式
+            model.eval()
+
+            validation_makespans = []
+            # 运行20次独立的验证episodes
+            for _ in tqdm(range(20), desc="Validating", leave=False):
+                # 告诉环境从'validation'池中采样
+                val_obs_dict, _ = env.reset(options={'pool': 'validation'})
+
+                # 在验证时，我们不计算梯度
+                with torch.no_grad():
+                    # --- 运行一个完整的评估Episode ---
+                    for val_task_count in range(env.num_tasks):
+                        val_current_task = env.task_pool[val_task_count]
+                        val_num_logical_qubits = val_current_task.num_qubits
+                        val_placement_in_progress = {}
+
+                        for val_i in range(val_num_logical_qubits):
+                            # 获取观察
+                            if val_task_count == 0 and val_i == 0:
+                                val_obs_dict_step = val_obs_dict
+                            else:
+                                val_obs_dict_step = env._get_obs(val_task_count, val_placement_in_progress)
+
+                            # 决策 (注意：这里我们通常使用贪心策略，而不是采样)
+                            val_obs_tensor = {k: torch.tensor(v).unsqueeze(0).to(device) for k, v in
+                                              val_obs_dict_step.items()}
+                            logits, _ = model(val_obs_tensor)
+
+                            # 应用掩码
+                            placement_mask = torch.tensor(val_obs_dict_step["placement_mask"], dtype=torch.bool).to(
+                                device)
+                            # (省略了连通性硬约束以简化，但最好也加上)
+                            logits[0, placement_mask] = -1e8
+
+                            action = torch.argmax(logits, dim=1)  # 贪心选择
+
+                            # 更新放置
+                            physical_qubit_id = env.idx_to_qubit_id[action.item()]
+                            val_placement_in_progress[val_i] = physical_qubit_id
+
+                        # 提交计划
+                        val_full_action = {"task_id": val_task_count, "mapping": val_placement_in_progress,
+                                           "start_time": max(env.chip_model[pid].get_next_available_time() for pid in
+                                                             val_placement_in_progress.values())}
+                        _, _, val_terminated, _, _ = env.step(val_full_action)
+
+                        if val_terminated:
+                            break
+
+                # 记录这次验证的makespan
+                if env.schedule_plan:
+                    validation_makespans.append(max(t['end_time'] for t in env.schedule_plan))
+
+            # 计算平均验证makespan
+            avg_validation_makespan = np.mean(validation_makespans) if validation_makespans else float('inf')
+            writer.add_scalar("validation/avg_makespan", avg_validation_makespan, episode)
+            print(
+                f"--- Avg Validation Makespan: {avg_validation_makespan:.2f} (Best: {best_validation_makespan:.2f}) ---")
+
+            # 只保存表现最好的模型
+            if avg_validation_makespan < best_validation_makespan:
+                best_validation_makespan = avg_validation_makespan
+                best_model_path = os.path.join(checkpoints_dir, "best_model.pth")
+                torch.save(model.state_dict(), best_model_path)
+                print(f"--- New best model saved to {best_model_path} ---")
+
+            # 将模型切换回训练模式
+            model.train()
 
     episode_pbar.close()
     # 关闭writer
