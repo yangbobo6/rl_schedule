@@ -37,7 +37,7 @@ class Hyperparameters:
     ENTROPY_BETA = 0.01  # 可以从一个稍小的值开始，防止在长训练中过早停止探索
     PPO_EPOCHS = 10  # 保持较高的PPO Epochs
     ROLLOUT_LENGTH = 16384  # 充分利用GPU和内存，收集高质量数据
-    MINI_BATCH_SIZE = 1024  # 使用更大的批次以获得更稳定的梯度
+    MINI_BATCH_SIZE = 256  # 使用更大的批次以获得更稳定的梯度
 
     # --- GNN参数 ---
     GNN_NODE_DIM = 1
