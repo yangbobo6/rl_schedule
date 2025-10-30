@@ -18,6 +18,10 @@ env/
 *.log
 *.tmp
 *.swp
+*.png
+*.sh
+*.pkl
+*.pth
 
 # 结果输出文件（可根据需要调整）
 results/
