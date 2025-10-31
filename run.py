@@ -447,13 +447,6 @@ def main():
             "LR": f"{scheduler.get_last_lr()[0]:.1e}"
         })
 
-        # 每隔N个episode，或者在训练结束时，画一张图
-        if episode % 50 == 0 or episode == args.MAX_EPISODES - 1:
-            if env.schedule_plan:
-                # 定义图片的保存路径
-                plot_save_path = os.path.join(plots_dir, f"schedule_episode_{episode}.png")
-                # 调用绘图函数并传入路径
-                plot_schedule(env.schedule_plan, args.CHIP_SIZE, baseline_makespan,plot_save_path)
         # --- 写入TensorBoard日志 ---
         writer.add_scalar("charts/makespan", final_makespan, episode)
         writer.add_scalar("charts/avg_fidelity", final_avg_fidelity, episode)
