@@ -486,47 +486,111 @@ def main():
             model.eval()
 
             validation_makespans = []
+            # 运行N次独立的验证episodes，以获得更稳定的平均性能
+            num_validation_episodes = 20
             # 运行20次独立的验证episodes
-            for _ in tqdm(range(20), desc="Validating", leave=False):
+            for _ in tqdm(range(num_validation_episodes), desc="Validating", leave=False):
                 # 告诉环境从'validation'池中采样
                 val_obs_dict, _ = env.reset(options={'pool': 'validation'})
 
                 # 在验证时，我们不计算梯度
                 with torch.no_grad():
                     # --- 运行一个完整的评估Episode ---
-                    for val_task_count in range(env.num_tasks):
-                        val_current_task = env.task_pool[val_task_count]
-                        val_num_logical_qubits = val_current_task.num_qubits
+                    for _ in range(env.num_tasks):
+                        # === 1. 任务选择 (GNN Selector - 贪心模式) ===
+                        candidate_tasks = env.get_candidate_tasks()
+                        if not candidate_tasks: break
+
+                        chip_graph_data = env.get_chip_state_graph_data()
+
+                        # 如果GNN选择器存在，则使用它
+                        if gnn_selector:
+                            task_graph_data_list = [networkx_to_pyg_data(t.interaction_graph) for t in candidate_tasks]
+
+                            chip_batch = Batch.from_data_list([chip_graph_data] * len(candidate_tasks)).to(device)
+                            task_batch = Batch.from_data_list(task_graph_data_list).to(device)
+
+                            scores = gnn_selector(chip_batch, task_batch).cpu().numpy().flatten()
+
+                            # 选择分数最高的任务
+                            chosen_task_local_index = np.argmax(scores)
+                            chosen_task = candidate_tasks[chosen_task_local_index]
+                        else:
+                            # 降级为随机选择
+                            chosen_task = np.random.choice(candidate_tasks)
+
+                        val_task_id = chosen_task.id
+
+                        # === 2. 任务放置 (RL Placer - 贪心模式) ===
+                        val_task_id = chosen_task.id
+                        val_current_task = env.task_pool[val_task_id]
                         val_placement_in_progress = {}
 
-                        for val_i in range(val_num_logical_qubits):
-                            # 获取观察
-                            if val_task_count == 0 and val_i == 0:
-                                val_obs_dict_step = val_obs_dict
+                        # --- 微观放置循环 ---
+                        for i in range(val_current_task.num_qubits):
+                            # a. 获取观察
+                            obs_dict_step = env._get_obs(val_task_id, val_placement_in_progress)
+                            obs_tensor = {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(device) for k, v in
+                                          obs_dict_step.items()}
+
+                            # b. 模型决策
+                            logits, _ = model(obs_tensor)
+
+                            # c. 应用与训练时完全相同的硬约束掩码
+                            # c.1 获取已占用的比特掩码
+                            placement_mask = torch.tensor(obs_dict_step["placement_mask"], dtype=torch.bool).to(device)
+
+                            # c.2 获取连通性约束掩码
+                            connectivity_mask = torch.ones_like(placement_mask)
+                            current_logical_idx = i
+                            task_graph = val_current_task.interaction_graph
+
+                            if i == 0:
+                                # 第一个比特可以放在任何未占用的地方
+                                connectivity_mask = placement_mask.clone()
                             else:
-                                val_obs_dict_step = env._get_obs(val_task_count, val_placement_in_progress)
+                                valid_neighbors = set()
+                                # 检查当前逻辑比特 l_i 是否需要与任何已放置的比特 l_j 连接
+                                needs_connection = any(task_graph.has_edge(current_logical_idx, j) for j in
+                                                       val_placement_in_progress.keys())
 
-                            # 决策 (注意：这里我们通常使用贪心策略，而不是采样)
-                            val_obs_tensor = {k: torch.tensor(v).unsqueeze(0).to(device) for k, v in
-                                              val_obs_dict_step.items()}
-                            logits, _ = model(val_obs_tensor)
+                                if not needs_connection:
+                                    # 如果 l_i 与已放置的部分没有连接，可以放在任何未占用的地方
+                                    connectivity_mask = placement_mask.clone()
+                                else:
+                                    # 否则，它必须放在已放置邻居的空闲邻居位置
+                                    for placed_logical_idx, placed_physical_id in val_placement_in_progress.items():
+                                        if task_graph.has_edge(current_logical_idx, placed_logical_idx):
+                                            for neighbor_id in env.chip_model[placed_physical_id].connectivity:
+                                                neighbor_idx = env.qubit_id_to_idx[neighbor_id]
+                                                if not placement_mask[neighbor_idx]:
+                                                    valid_neighbors.add(neighbor_idx)
 
-                            # 应用掩码
-                            placement_mask = torch.tensor(val_obs_dict_step["placement_mask"], dtype=torch.bool).to(
-                                device)
-                            # (省略了连通性硬约束以简化，但最好也加上)
-                            logits[0, placement_mask] = -1e8
+                                    if valid_neighbors:
+                                        indices = torch.tensor(list(valid_neighbors), dtype=torch.long, device=device)
+                                        connectivity_mask.scatter_(0, indices, 0)  # 将合法位置的掩码设为False
+                                    else:
+                                        # 如果所有邻居都被占用了，允许放在任何未占用的地方，依赖奖励惩罚
+                                        connectivity_mask = placement_mask.clone()
 
-                            action = torch.argmax(logits, dim=1)  # 贪心选择
+                            # c.3 合并掩码
+                            final_mask = placement_mask | connectivity_mask
+                            logits[0, final_mask] = -1e8
 
-                            # 更新放置
+                            # d. 【核心区别】使用 argmax 进行贪心选择
+                            action = torch.argmax(logits, dim=1)
+
+                            # e. 更新本次评估中的放置方案
                             physical_qubit_id = env.idx_to_qubit_id[action.item()]
-                            val_placement_in_progress[val_i] = physical_qubit_id
+                            val_placement_in_progress[i] = physical_qubit_id
 
-                        # 提交计划
-                        val_full_action = {"task_id": val_task_count, "mapping": val_placement_in_progress,
-                                           "start_time": max(env.chip_model[pid].get_next_available_time() for pid in
-                                                             val_placement_in_progress.values())}
+                        # === 3. 提交计划 ===
+                        final_mapping = val_placement_in_progress
+                        start_time = max(env.chip_model[pid].get_next_available_time() for pid in
+                                         final_mapping.values()) if final_mapping else 0.0
+
+                        val_full_action = {"task_id": val_task_id, "mapping": final_mapping, "start_time": start_time}
+
                         _, _, val_terminated, _, _ = env.step(val_full_action)
 
                         if val_terminated:

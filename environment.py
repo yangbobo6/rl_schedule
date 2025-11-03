@@ -38,8 +38,7 @@ class QuantumSchedulingEnv(gym.Env):
         # --- 核心数据结构 ---
         self.task_generator = TaskGenerator(gate_times, gnn_model, device)
         self.chip_model: Dict[Tuple[int, int], PhysicalQubit] = self._create_chip_model()
-        # self.task_pool: Dict[int, QuantumTask] = self._create_task_pool()
-        self.task_pool = self.task_generator.build_large_task_pool(num_tasks=100)
+        self.task_pool: Dict[int, QuantumTask] = self._create_task_pool()
         self.schedule_plan: List[Dict] = []
         self.current_step = 0
         # 简化版SWAP估算器：假设每个SWAP门增加固定的时间和错误

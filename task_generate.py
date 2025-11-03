@@ -39,6 +39,7 @@ class TaskGenerator:
         self.device = device
         # 创建严格分离的任务池
         print("Generating separate task pools for train, validation, and test...")
+        self._global_task_id_counter = 0
         self.train_pool = self._generate_specific_tasks(2000)  # 大量的训练任务
         self.validation_pool = self._generate_specific_tasks(200)  # 用于调整超参数
         self.test_pool = self._generate_specific_tasks(200)  # 用于最终的、一锤定音的性能评估
@@ -64,21 +65,30 @@ class TaskGenerator:
 
         # 从指定池中随机采样
         source_keys = list(source_pool.keys())
+        if len(source_keys) < num_tasks:
+            raise ValueError(f"Pool '{pool}' has only {len(source_keys)} tasks, but {num_tasks} were requested.")
+
         sampled_ids = np.random.choice(source_keys, num_tasks, replace=False)
-        episode_tasks = {i: source_pool[tid] for i, tid in enumerate(sampled_ids)}
+        # 直接使用采样到的全局ID作为新字典的键
+        episode_tasks = {tid: source_pool[tid] for tid in sampled_ids}
         return episode_tasks
 
     def _generate_specific_tasks(self, num_to_generate: int) -> dict:
-        """一个辅助函数，用于生成指定数量的任务，避免与旧方法混淆"""
-        # 这个方法的内容与您之前的 generate_tasks 基本相同
+        """辅助函数，生成任务并赋予全局唯一ID"""
         tasks = {}
-        for i in range(num_to_generate):
-            # 确保每次生成的任务都有独一无二的属性
-            # 可以通过增大随机范围或使用不同的随机种子来实现
-            num_qubits = np.random.randint(3, 8)  # 增加任务多样性
+        for _ in range(num_to_generate):
+            # 使用全局计数器作为唯一ID
+            task_id = self._global_task_id_counter
+
+            num_qubits = np.random.randint(3, 8)
             circuit = self._create_dummy_circuit(num_qubits)
-            task = self._parse_circuit(i, circuit)
-            tasks[i] = task
+
+            # 解析并创建Task对象
+            task = self._parse_circuit(task_id, circuit)
+            tasks[task_id] = task
+
+            # ID自增
+            self._global_task_id_counter += 1
         return tasks
 
 
