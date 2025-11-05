@@ -51,7 +51,7 @@ class Hyperparameters:
 
     # 奖励权重
     REWARD_WEIGHTS = {
-        "compaction": 5.0, # 时间压缩
+        "compaction": 2.5, # 时间压缩
         "swap": 1.5,       # swap次数
         "fidelity": 0.5,   # 保真度
         "crosstalk": 0.7,  # 串扰

@@ -4,10 +4,14 @@ import torch
 import numpy as np
 import os
 import argparse
+
+from torch_geometric.data import Batch
 from tqdm import tqdm
 import json
 import matplotlib
 import time
+
+from train_selector import SiameseGNNSelector
 
 # 设置matplotlib后端为'Agg'，以避免在无GUI的环境中出错
 matplotlib.use('Agg')
@@ -16,25 +20,26 @@ matplotlib.use('Agg')
 # 假设您的代码结构使得这些导入能够正常工作
 from environment import QuantumSchedulingEnv
 from models.actor_critic import TransformerActorCritic
-from models.gnn_encoder import GNNEncoder
+from models.gnn_encoder import GNNEncoder, networkx_to_pyg_data
 from run import Hyperparameters  # 从run.py导入超参数类
 from visualizer import plot_schedule
+
 
 def test(run_dir: str, num_test_episodes: int = 100):
     """
     加载一个训练好的模型，在测试集 (test_pool) 上进行评估，并报告性能。
-    
+
     Args:
         run_dir (str): 包含模型检查点 ('checkpoints/best_model.pth') 的训练结果目录。
         num_test_episodes (int): 用于评估的独立 aepisode 数量。
     """
     print(f"--- Starting Final Evaluation for Run: {run_dir} ---")
-    
+
     # --- 1. 加载配置和设置环境 ---
     args = Hyperparameters()
-    device = torch.device("cpu") # 评估通常在CPU上进行即可，速度足够快
+    device = torch.device("cpu")  # 评估通常在CPU上进行即可，速度足够快
     print(f"Using device: {device}")
-    
+
     model_path = os.path.join(run_dir, "checkpoints", "best_model.pth")
     if not os.path.exists(model_path):
         print(f"Error: Best model not found at '{model_path}'")
@@ -46,7 +51,6 @@ def test(run_dir: str, num_test_episodes: int = 100):
     os.makedirs(gantt_charts_dir, exist_ok=True)
     print(f"Test outputs will be saved in: {test_output_dir}")
 
-
     # --- 2. 初始化所有必要的组件 (与run.py的初始化逻辑保持一致) ---
     gnn_model = GNNEncoder(
         node_feature_dim=args.GNN_NODE_DIM,
@@ -54,7 +58,7 @@ def test(run_dir: str, num_test_episodes: int = 100):
         output_dim=args.GNN_OUTPUT_DIM
     ).to(device)
     # GNN模型在预计算时使用，不需要训练
-    gnn_model.eval() 
+    gnn_model.eval()
 
     gate_times = {
         'u3': 50, 'u': 50, 'p': 30, 'cx': 350, 'id': 30,
@@ -87,8 +91,8 @@ def test(run_dir: str, num_test_episodes: int = 100):
     except Exception as e:
         print(f"Error loading model weights: {e}")
         return
-        
-    model.eval() # 必须设置为评估模式！
+
+    model.eval()  # 必须设置为评估模式！
     print("Model and environment initialized successfully.")
 
     # --- 3. 在测试集上运行评估循环 ---
@@ -96,27 +100,58 @@ def test(run_dir: str, num_test_episodes: int = 100):
         "makespans": [], "fidelities": [], "swaps": [], "crosstalks": []
     }
 
+    gnn_selector_path = "models/gnn_selector_v0.pth"  # 假设路径固定
+    gnn_selector = SiameseGNNSelector(
+        chip_node_dim=1, task_node_dim=1,
+        hidden_dim=64, embed_dim=32
+    ).to(device)
+    try:
+        gnn_selector.load_state_dict(torch.load(gnn_selector_path, map_location=device))
+        gnn_selector.eval()
+    except FileNotFoundError:
+        print("Warning: GNN Selector model not found. Task selection will be random.")
+        gnn_selector = None
+
     for episode_idx in tqdm(range(num_test_episodes), desc="Running Test Episodes"):
         # 告诉环境从'test'池中采样
         obs_dict, _ = env.reset(options={'pool': 'test'})
-        
+
         # 在评估时，我们不计算梯度
         with torch.no_grad():
-            for task_count in range(env.num_tasks):
-                current_task = env.task_pool[task_count]
+            for _ in range(env.num_tasks):
+                # === 1. 任务选择 (与run.py完全一致) ===
+                candidate_tasks = env.get_candidate_tasks()
+                if not candidate_tasks: break
+
+                if gnn_selector:
+                    chip_graph_data = env.get_chip_state_graph_data()
+                    task_graph_data_list = [networkx_to_pyg_data(t.interaction_graph) for t in candidate_tasks]
+
+                    chip_batch = Batch.from_data_list([chip_graph_data] * len(candidate_tasks)).to(device)
+                    task_batch = Batch.from_data_list(task_graph_data_list).to(device)
+
+                    scores = gnn_selector(chip_batch, task_batch).cpu().numpy().flatten()
+
+                    chosen_task_local_index = np.argmax(scores)
+                    chosen_task = candidate_tasks[chosen_task_local_index]
+                else:
+                    chosen_task = np.random.choice(candidate_tasks)
+
+                # 这是正确的、动态选择出的任务ID
+                task_id = chosen_task.id
+                current_task = env.task_pool[task_id]
+
+                # === 2. 任务放置 (与run.py的验证逻辑一致) ===
                 num_logical_qubits = current_task.num_qubits
                 placement_in_progress = {}
 
                 for i in range(num_logical_qubits):
                     # 获取观察
-                    if task_count == 0 and i == 0:
-                        obs_dict_step = obs_dict
-                    else:
-                        obs_dict_step = env._get_obs(task_count, placement_in_progress)
-                    
+                    # 注意：现在需要传递正确的 task_id
+                    obs_dict_step = env._get_obs(task_id, placement_in_progress)
+
                     obs_tensor = {k: torch.tensor(v).unsqueeze(0).to(device) for k, v in obs_dict_step.items()}
-                    
-                    # 决策 (使用贪心策略，即选择概率最高的动作)
+
                     logits, _ = model(obs_tensor)
 
                     # --- 硬约束掩码逻辑 ---
@@ -146,18 +181,19 @@ def test(run_dir: str, num_test_episodes: int = 100):
 
                     final_mask = placement_mask | connectivity_mask
                     logits[0, final_mask] = -1e8
-                    
-                    action = torch.argmax(logits, dim=1) # 贪心选择
-                    
+
+                    action = torch.argmax(logits, dim=1)  # 贪心选择
+
                     # 更新放置
                     physical_qubit_id = env.idx_to_qubit_id[action.item()]
                     placement_in_progress[i] = physical_qubit_id
-                
+
                 # 提交计划
                 final_mapping = placement_in_progress
-                start_time = max(env.chip_model[pid].get_next_available_time() for pid in final_mapping.values()) if final_mapping else 0
-                full_action = {"task_id": task_count, "mapping": final_mapping, "start_time": start_time}
-                
+                start_time = max(env.chip_model[pid].get_next_available_time() for pid in
+                                 final_mapping.values()) if final_mapping else 0
+                full_action = {"task_id": task_id, "mapping": final_mapping, "start_time": start_time}
+
                 # 我们只关心env.step()返回的info字典
                 _, _, terminated, _, info = env.step(full_action)
 
@@ -165,7 +201,7 @@ def test(run_dir: str, num_test_episodes: int = 100):
                 test_results["fidelities"].append(info.get("final_fidelity", 0))
                 test_results["swaps"].append(info.get("num_swaps", 0))
                 test_results["crosstalks"].append(info.get("crosstalk_score", 0))
-                
+
                 if terminated:
                     break
 
@@ -184,15 +220,15 @@ def test(run_dir: str, num_test_episodes: int = 100):
     avg_fidelity = np.mean(test_results["fidelities"]) if test_results["fidelities"] else 0
     avg_swaps = np.mean(test_results["swaps"]) if test_results["swaps"] else 0
     avg_crosstalk = np.mean(test_results["crosstalks"]) if test_results["crosstalks"] else 0
-    
+
     results_str = (
-        "\n" + "="*30 + " Final Test Results " + "="*30 + "\n"
-        f"Evaluated on {num_test_episodes} episodes from the 'test' pool.\n\n"
-        f"  - Average Makespan:         {avg_makespan:.2f} us\n"
-        f"  - Average Task Fidelity:    {avg_fidelity:.4f}\n"
-        f"  - Average SWAPs per Task:   {avg_swaps:.2f}\n"
-        f"  - Average Crosstalk Score:  {avg_crosstalk:.4f}\n"
-        + "="*82 + "\n"
+            "\n" + "=" * 30 + " Final Test Results " + "=" * 30 + "\n"
+                                                                  f"Evaluated on {num_test_episodes} episodes from the 'test' pool.\n\n"
+                                                                  f"  - Average Makespan:         {avg_makespan:.2f} us\n"
+                                                                  f"  - Average Task Fidelity:    {avg_fidelity:.4f}\n"
+                                                                  f"  - Average SWAPs per Task:   {avg_swaps:.2f}\n"
+                                                                  f"  - Average Crosstalk Score:  {avg_crosstalk:.4f}\n"
+            + "=" * 82 + "\n"
     )
     print(results_str)
 
@@ -207,13 +243,14 @@ def test(run_dir: str, num_test_episodes: int = 100):
         }, f, indent=4)
     print(f"Test results saved to {results_file_path}")
 
+
 if __name__ == '__main__':
     # 使用 argparse 来接收命令行参数，这是一种很好的实践
     parser = argparse.ArgumentParser(description="Evaluate a trained quantum scheduling agent.")
     parser.add_argument(
-        "--run_dir", 
-        type=str, 
-        required=True, 
+        "--run_dir",
+        type=str,
+        required=True,
         help="Path to the result directory of a training run (e.g., 'results/20250923-120000')."
     )
     parser.add_argument(
@@ -222,7 +259,7 @@ if __name__ == '__main__':
         default=100,
         help="Number of test episodes to run for evaluation."
     )
-    
+
     script_args = parser.parse_args()
-    
+
     test(script_args.run_dir, num_test_episodes=script_args.episodes)
