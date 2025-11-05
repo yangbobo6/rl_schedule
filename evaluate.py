@@ -1,5 +1,7 @@
 # 文件: evaluate.py
+import argparse
 import time
+from typing import Dict
 
 import torch
 import numpy as np
@@ -19,8 +21,141 @@ from run import Hyperparameters  # 从run.py导入超参数类
 from visualizer import plot_comparison
 
 # ==============================================================================
-# SECTION 1: QuMC风格的启发式调度器
+# SECTION 1: 调度器算法的实现
 # ==============================================================================
+
+# --- 调度器基类 (可选，但推荐，用于规范接口) ---
+class BaseScheduler:
+    def __init__(self, name: str):
+        self.name = name
+
+    def schedule(self, env: QuantumSchedulingEnv) -> list:
+        """
+        接收一个配置好的环境，返回一个完整的调度计划。
+        """
+        raise NotImplementedError
+
+
+class QuMCScheduler(BaseScheduler):
+    def __init__(self):
+        super().__init__("QuMC-style Heuristic")
+
+    def _find_best_partition(self, task, env, used_qubits_ids):
+        best_partition = None
+        best_score = -float('inf')
+
+        for start_node_id in env.chip_model.keys():
+            if start_node_id in used_qubits_ids:
+                continue
+
+            partition_nodes = {start_node_id}
+
+            while len(partition_nodes) < task.num_qubits:
+                boundary_neighbors = set()
+                for node_in_partition in partition_nodes:
+                    for neighbor_id in env.chip_model[node_in_partition].connectivity:
+                        if neighbor_id not in partition_nodes and neighbor_id not in used_qubits_ids:
+                            boundary_neighbors.add(neighbor_id)
+
+                if not boundary_neighbors: break
+
+                best_neighbor = max(boundary_neighbors, key=lambda nid: env.chip_model[nid].fidelity_1q, default=None)
+
+                if best_neighbor:
+                    partition_nodes.add(best_neighbor)
+                else:
+                    break
+
+            if len(partition_nodes) == task.num_qubits:
+                partition_score = sum(env.chip_model[nid].fidelity_1q for nid in partition_nodes)
+                if partition_score > best_score:
+                    best_score = partition_score
+                    best_partition = list(partition_nodes)
+        return best_partition
+
+    def _map_to_partition(self, task, partition, env):
+        mapping = {}
+        num_swaps = 0
+        sorted_logical = sorted(task.interaction_graph.degree, key=lambda x: x[1], reverse=True)
+        available_physical = list(partition)
+
+        for logical_id, _ in sorted_logical:
+            best_physical_id, min_cost = None, float('inf')
+
+            for physical_id in available_physical:
+                cost = sum(1 for pl, pp in mapping.items() if
+                           task.interaction_graph.has_edge(logical_id, pl) and physical_id not in env.chip_model[
+                               pp].connectivity)
+                if cost < min_cost:
+                    min_cost, best_physical_id = cost, physical_id
+
+            if best_physical_id:
+                mapping[logical_id] = best_physical_id
+                available_physical.remove(best_physical_id)
+                num_swaps += min_cost
+        return mapping, num_swaps
+
+    def schedule(self, env: QuantumSchedulingEnv) -> list:
+        print(f"\n--- Running {self.name} ---")
+        env.reset()
+
+        all_tasks = list(env.task_pool.values())
+        sorted_tasks = sorted(all_tasks, key=get_cnot_density, reverse=True)
+
+        schedule_plan = []
+        remaining_tasks = list(sorted_tasks)
+        pbar = tqdm(total=len(all_tasks), desc="QuMC Heuristic")
+        batch_start_time = 0.0
+
+        while remaining_tasks:
+            batch_to_schedule, temp_used_qubits, tasks_for_next_round = [], set(), []
+
+            for task in remaining_tasks:
+                available_qubits_count = env.num_qubits - len(temp_used_qubits)
+                if available_qubits_count < task.num_qubits:
+                    tasks_for_next_round.append(task)
+                    continue
+
+                best_partition = self._find_best_partition(task, env, temp_used_qubits)
+
+                if best_partition:
+                    mapping, num_swaps = self._map_to_partition(task, best_partition, env)
+                    batch_to_schedule.append({'task': task, 'mapping': mapping, 'swaps': num_swaps})
+                    temp_used_qubits.update(best_partition)
+                else:
+                    tasks_for_next_round.append(task)
+
+            if not batch_to_schedule:
+                if remaining_tasks: print(
+                    f"Warning: Deadlock in QuMC, {len(remaining_tasks)} tasks cannot be scheduled.")
+                break
+
+            max_batch_duration = 0
+            current_batch_plan = []
+            for item in batch_to_schedule:
+                task, mapping, num_swaps = item['task'], item['mapping'], item['swaps']
+                duration = task.estimated_duration + num_swaps * (env.swap_penalty["duration"] / 1e3)
+                max_batch_duration = max(max_batch_duration, duration)
+                current_batch_plan.append((task, mapping, num_swaps, duration))
+
+            for task, mapping, num_swaps, duration in current_batch_plan:
+                schedule_plan.append({
+                    "task_id": task.id, "mapping": mapping,
+                    "start_time": batch_start_time, "end_time": batch_start_time + duration,
+                    "num_swaps": num_swaps,
+                    "final_fidelity": env._estimate_swaps_and_fidelity(task, mapping)[1],
+                    "crosstalk_score": calculate_crosstalk_test(mapping, batch_start_time, batch_start_time + duration,
+                                                                schedule_plan)
+                })
+                pbar.update(1)
+
+            batch_start_time += max_batch_duration
+            remaining_tasks = tasks_for_next_round
+
+        pbar.close()
+        return schedule_plan
+
+
 
 def get_cnot_density(task):
     """计算任务的CNOT密度"""
@@ -29,218 +164,123 @@ def get_cnot_density(task):
     return num_cnots / num_qubits if num_qubits > 0 else 0
 
 
-def find_best_partition_heuristic(task, env, used_qubits_indices):
-    """简化的启发式分区查找器"""
-    best_partition = None
-    best_score = -float('inf')
-
-    for start_node_idx in range(env.num_qubits):
-        if start_node_idx in used_qubits_indices:
-            continue
-        start_node_id = env.idx_to_qubit_id[start_node_idx]
-
-        partition_nodes = {start_node_id}
-        current_used_indices = {start_node_idx}
-
-        while len(partition_nodes) < task.num_qubits:
-            boundary_neighbors = set()
-            for node_in_partition in partition_nodes:
-                for neighbor_id in env.chip_model[node_in_partition].connectivity:
-                    if neighbor_id not in partition_nodes and env.qubit_id_to_idx[
-                        neighbor_id] not in used_qubits_indices:
-                        boundary_neighbors.add(neighbor_id)
-
-            if not boundary_neighbors: break
-
-            best_neighbor = max(boundary_neighbors, key=lambda nid: env.chip_model[nid].fidelity_1q, default=None)
-
-            if best_neighbor:
-                partition_nodes.add(best_neighbor)
-                current_used_indices.add(env.qubit_id_to_idx[best_neighbor])
-            else:
-                break
-
-        if len(partition_nodes) == task.num_qubits:
-            partition_score = sum(env.chip_model[nid].fidelity_1q for nid in partition_nodes)
-            if partition_score > best_score:
-                best_score = partition_score
-                best_partition = list(partition_nodes)
-
-    return best_partition
-
-
-def map_task_to_partition(task, partition, env):
-    """在给定分区内进行贪心映射"""
-    mapping = {}
-    num_swaps = 0
-
-    sorted_logical = sorted(task.interaction_graph.degree, key=lambda x: x[1], reverse=True)
-    available_physical = list(partition)
-
-    for logical_id, _ in sorted_logical:
-        best_physical_id = None
-        min_cost = float('inf')
-
-        for physical_id in available_physical:
-            cost = 0
-            for placed_logic, placed_phys in mapping.items():
-                if task.interaction_graph.has_edge(logical_id, placed_logic):
-                    if physical_id not in env.chip_model[placed_phys].connectivity:
-                        cost += 1
-
-            if cost < min_cost:
-                min_cost = cost
-                best_physical_id = physical_id
-
-        if best_physical_id:
-            mapping[logical_id] = best_physical_id
-            available_physical.remove(best_physical_id)
-            num_swaps += min_cost
-
-    return mapping, num_swaps
-
-
-def run_qumc_heuristic_scheduler(env: QuantumSchedulingEnv):
-    """运行简化的QuMC启发式调度算法"""
-    print("\n--- Running QuMC-style Heuristic Scheduler ---")
-
-    tasks = list(env.task_pool.values())
-    sorted_tasks = sorted(tasks, key=get_cnot_density, reverse=True)
-
-    schedule_plan = []
-    qubit_release_times = np.zeros(env.num_qubits)
-    used_qubits_indices = set()
-
-    for task in tqdm(sorted_tasks, desc="QuMC Heuristic"):
-        best_partition = find_best_partition_heuristic(task, env, used_qubits_indices)
-        if not best_partition:
-            print(f"Warning: Could not find a valid partition for task {task.id}")
-            continue
-
-        mapping, num_swaps = map_task_to_partition(task, best_partition, env)
-
-        partition_indices = [env.qubit_id_to_idx[pid] for pid in best_partition]
-        start_time = np.max(qubit_release_times[partition_indices])
-        duration = task.estimated_duration + num_swaps * (env.swap_penalty["duration"] / 1e3)
-        end_time = start_time + duration
-
-        for idx in partition_indices:
-            qubit_release_times[idx] = end_time
-        used_qubits_indices.update(partition_indices)
-        crosstalk_score = env._calculate_crosstalk(mapping, start_time, end_time)
-        # 然后再将新任务添加到 env.schedule_plan
-        new_schedule_item = {
-            "task_id": task.id, "mapping": mapping,
-            "start_time": start_time, "end_time": end_time,
-            "num_swaps": num_swaps,
-            "final_fidelity": env._estimate_swaps_and_fidelity(task, mapping)[1],
-            "crosstalk_score": crosstalk_score
-        }
-        schedule_plan.append(new_schedule_item)
-
-        # 为了让下一次循环的_calculate_crosstalk能看到最新状态，我们需要更新env的状态
-        env.schedule_plan = schedule_plan
-
-    return schedule_plan
-
+def calculate_crosstalk_test(self, mapping: Dict, start_time: float, end_time: float, schedule_plan) -> float:
+        # 占位符：计算与已调度任务的串扰
+        score = 0.0
+        for scheduled in schedule_plan:
+            # 检查时间重叠
+            if max(start_time, scheduled['start_time']) < min(end_time, scheduled['end_time']):
+                # 检查物理邻接
+                for p_id1 in mapping.values():
+                    for p_id2 in scheduled['mapping'].values():
+                        if p_id2 in self.chip_model[p_id1].connectivity:
+                            score += self.chip_model[p_id1].connectivity[p_id2]['crosstalk_coeff']
+        return score
 
 # ==============================================================================
 # SECTION 2: RL调度器评估
 # ==============================================================================
+class RLScheduler(BaseScheduler):
+    def __init__(self, model_path: str, gnn_selector_path: str, args: Hyperparameters):
+        super().__init__("Reinforcement Learning Scheduler")
+        self.model_path = model_path
+        self.gnn_selector_path = gnn_selector_path
+        self.args = args
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def run_rl_scheduler(env: QuantumSchedulingEnv, model_path: str, gnn_selector_path: str, args: Hyperparameters):
-    """运行我们训练好的RL调度器 (GNN选择 + Transformer放置)"""
-    print("\n--- Running RL Scheduler ---")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def schedule(self, env: QuantumSchedulingEnv) -> list:
+        print(f"\n--- Running {self.name} ---")
 
-    # 1. 加载模型
-    gnn_selector = SiameseGNNSelector(
-        chip_node_dim=1, task_node_dim=1,
-        hidden_dim=64, embed_dim=32
-    ).to(device)
-    gnn_selector.load_state_dict(torch.load(gnn_selector_path, map_location=device))
-    gnn_selector.eval()
+        gnn_selector = SiameseGNNSelector(chip_node_dim=1, task_node_dim=1, hidden_dim=64, embed_dim=32).to(self.device)
+        gnn_selector.load_state_dict(torch.load(self.gnn_selector_path, map_location=self.device))
+        gnn_selector.eval()
 
-    rl_placer = TransformerActorCritic(
-        env.observation_space, env.num_qubits,
-        d_model=args.D_MODEL, nhead=args.N_HEAD,
-        num_encoder_layers=args.NUM_ENCODER_LAYERS
-    ).to(device)
-    rl_placer.load_state_dict(torch.load(model_path, map_location=device))
-    rl_placer.eval()
+        rl_placer = TransformerActorCritic(
+            env.observation_space, env.num_qubits,
+            d_model=self.args.D_MODEL, nhead=self.args.N_HEAD, num_encoder_layers=self.args.NUM_ENCODER_LAYERS
+        ).to(self.device)
+        rl_placer.load_state_dict(torch.load(self.model_path, map_location=self.device))
+        rl_placer.eval()
 
-    # 2. 运行一个完整的Episode进行评估
-    # obs_dict, _ = env.reset()
-
-    for _ in tqdm(range(env.num_tasks), desc="RL Scheduler"):
-        # a. GNN选择任务
-        candidate_tasks = env.get_candidate_tasks()
-        if not candidate_tasks: break
-
-        chip_graph_data = env.get_chip_state_graph_data()
-        task_graph_data_list = [networkx_to_pyg_data(t.interaction_graph) for t in candidate_tasks]
+        env.reset()
 
         with torch.no_grad():
-            chip_batch = Batch.from_data_list([chip_graph_data] * len(candidate_tasks)).to(device)
-            task_batch = Batch.from_data_list(task_graph_data_list).to(device)
-            scores = gnn_selector(chip_batch, task_batch).cpu().numpy().flatten()
+            for _ in tqdm(range(env.num_tasks), desc="RL Scheduler"):
+                candidate_tasks = env.get_candidate_tasks()
+                if not candidate_tasks: break
 
-        chosen_task_local_index = np.argmax(scores)
-        chosen_task = candidate_tasks[chosen_task_local_index]
-        task_id = chosen_task.id
+                chip_graph_data = env.get_chip_state_graph_data()
+                task_graph_data_list = [networkx_to_pyg_data(t.interaction_graph) for t in candidate_tasks]
 
-        # b. RL放置任务
-        current_task = env.task_pool[task_id]
-        placement_in_progress = {}
-        for i in range(current_task.num_qubits):
-            obs_dict = env._get_obs(task_id, placement_in_progress)
-            obs_tensor = {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(device) for k, v in obs_dict.items()}
+                chip_batch = Batch.from_data_list([chip_graph_data] * len(candidate_tasks)).to(self.device)
+                task_batch = Batch.from_data_list(task_graph_data_list).to(self.device)
+                scores = gnn_selector(chip_batch, task_batch).cpu().numpy().flatten()
 
-            with torch.no_grad():
-                logits, _ = rl_placer(obs_tensor)
+                chosen_task_local_index = np.argmax(scores)
+                chosen_task = candidate_tasks[chosen_task_local_index]
+                task_id = chosen_task.id
 
-            final_mask = torch.tensor(obs_dict["placement_mask"], dtype=torch.bool).to(device)
-            logits[0, final_mask] = -1e8
+                current_task = env.task_pool[task_id]
+                placement_in_progress = {}
+                for i in range(current_task.num_qubits):
+                    obs_dict_step = env._get_obs(task_id, placement_in_progress)
+                    obs_tensor = {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(self.device) for k, v in
+                                  obs_dict_step.items()}
+                    logits, _ = rl_placer(obs_tensor)
 
-            # 直接在 logits 上取最大值的索引
-            action = logits.argmax(dim=-1)
+                    placement_mask = torch.tensor(obs_dict_step["placement_mask"], dtype=torch.bool).to(self.device)
+                    # For simplicity, we omit the complex connectivity mask in evaluation,
+                    # as the model should have learned to prefer connected placements. 加上
+                    connectivity_mask = torch.ones_like(placement_mask)
+                    task_graph = current_task.interaction_graph
 
-            physical_qubit_id = env.idx_to_qubit_id[action.item()]
-            placement_in_progress[i] = physical_qubit_id
+                    if i == 0:
+                        connectivity_mask = placement_mask.clone()
+                    else:
+                        valid_neighbors = set()
+                        needs_connection = any(task_graph.has_edge(i, j) for j in placement_in_progress.keys())
+                        if not needs_connection:
+                            connectivity_mask = placement_mask.clone()
+                        else:
+                            for placed_logical_idx, placed_physical_id in placement_in_progress.items():
+                                if task_graph.has_edge(i, placed_logical_idx):
+                                    for neighbor_id in env.chip_model[placed_physical_id].connectivity:
+                                        neighbor_idx = env.qubit_id_to_idx[neighbor_id]
+                                        if not placement_mask[neighbor_idx]:
+                                            valid_neighbors.add(neighbor_idx)
+                            if valid_neighbors:
+                                indices = torch.tensor(list(valid_neighbors), dtype=torch.long, device=device)
+                                connectivity_mask.scatter_(0, indices, 0)
+                            else:
+                                connectivity_mask = placement_mask.clone()
 
-        # c. 提交给环境
-        final_mapping = placement_in_progress
-        start_time = 0.0
-        if final_mapping:
-            # 这个计算是正确的，它依赖于 env.chip_model 的状态
-            start_time = max(env.chip_model[pid].get_next_available_time() for pid in final_mapping.values())
+                    final_mask = placement_mask | connectivity_mask
+                    logits[0, final_mask] = -1e8
 
-        full_action = {"task_id": task_id, "mapping": final_mapping, "start_time": start_time}
+                    action = torch.argmax(logits, dim=1)
+                    physical_qubit_id = env.idx_to_qubit_id[action.item()]
+                    placement_in_progress[i] = physical_qubit_id
 
-        # 调试打印
-        print(f"  - Placing Task {task_id}. Mapping: {final_mapping}")
-        release_times = {pid: env.chip_model[pid].get_next_available_time() for pid in final_mapping.values()}
-        print(f"  - Release times for mapped qubits: {release_times}")
-        print(f"  - Calculated Start Time: {start_time}")
+                final_mapping = placement_in_progress
+                start_time = max(env.chip_model[pid].get_next_available_time() for pid in
+                                 final_mapping.values()) if final_mapping else 0.0
+                full_action = {"task_id": task_id, "mapping": final_mapping, "start_time": start_time}
+                _, _, terminated, _, _ = env.step(full_action)
 
-        _, _, terminated, _, _ = env.step(full_action)
+                if terminated: break
+        return env.schedule_plan
 
-        if terminated:
-            break
-
-    return env.schedule_plan
 
 
 # ==============================================================================
-# SECTION 3: 主评估流程
+# SECTION 2: 主评估逻辑
 # ==============================================================================
 
 def calculate_metrics(schedule_plan: list) -> dict:
-    """从一个调度计划中计算所有关键指标"""
     if not schedule_plan:
         return {"makespan": float('inf'), "avg_swaps": float('inf'), "avg_fidelity": 0, "total_crosstalk": float('inf')}
 
-    makespan = max(item['end_time'] for item in schedule_plan)
+    makespan = max(item['end_time'] for item in schedule_plan) if schedule_plan else 0
     avg_swaps = np.mean([item['num_swaps'] for item in schedule_plan])
     avg_fidelity = np.mean([item['final_fidelity'] for item in schedule_plan])
     total_crosstalk = sum(item['crosstalk_score'] for item in schedule_plan)
@@ -249,110 +289,76 @@ def calculate_metrics(schedule_plan: list) -> dict:
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Evaluate and compare quantum scheduling algorithms.")
+    parser.add_argument("--model_path", type=str, required=True,
+                        help="Path to the trained RL placer model checkpoint (e.g., best_model.pth).")
+    parser.add_argument("--gnn_selector_path", type=str, default="models/gnn_selector_v0.pth",
+                        help="Path to the pre-trained GNN selector model.")
+    script_args = parser.parse_args()
     args = Hyperparameters()
 
-    # --- 1. 创建一个固定的评估环境 ---
     print("Creating a fixed evaluation environment...")
-
-    # 初始化GNN和gate_times等共享资源
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    gnn_for_task_gen = GNNEncoder(
-        node_feature_dim=args.GNN_NODE_DIM,
-        hidden_dim=args.GNN_HIDDEN_DIM,
-        output_dim=args.GNN_OUTPUT_DIM
-    ).to(device)
+    gnn_for_task_gen = GNNEncoder(args.GNN_NODE_DIM, args.GNN_HIDDEN_DIM, args.GNN_OUTPUT_DIM).to(device)
+    gate_times = {'u3': 50, 'u': 50, 'p': 30, 'cx': 350, 'id': 30, 'measure': 1000, 'rz': 30, 'sx': 40, 'x': 40}
 
-    gate_times = {
-        'u3': 50, 'u': 50, 'p': 30, 'cx': 350, 'id': 30,
-        'measure': 1000, 'rz': 30, 'sx': 40, 'x': 40
-    }
-
-    # 创建一个临时环境来生成一个固定的任务池，以保证公平对比
     temp_env = QuantumSchedulingEnv(
-        chip_size=args.CHIP_SIZE,
-        num_tasks=args.NUM_TASKS,
-        max_qubits_per_task=args.MAX_QUBITS_PER_TASK,
-        gnn_model=gnn_for_task_gen,
-        device=device,
-        gate_times=gate_times,
-        reward_weights=args.REWARD_WEIGHTS
+        chip_size=args.CHIP_SIZE, num_tasks=args.NUM_TASKS, max_qubits_per_task=args.MAX_QUBITS_PER_TASK,
+        gnn_model=gnn_for_task_gen, device=device, gate_times=gate_times, reward_weights=args.REWARD_WEIGHTS
     )
-    # 强制构建任务池
     temp_env.task_generator.build_large_task_pool(100)
-    # 获取一个固定的任务集用于本次评估
     fixed_task_pool = temp_env.task_generator.get_episode_tasks(args.NUM_TASKS)
-    print(f"Evaluation will be performed on a fixed set of {len(fixed_task_pool)} tasks.")
 
-    # --- 2. 运行 QuMC 启发式算法 ---
-    # 创建一个干净的环境实例
-    env_qumc = QuantumSchedulingEnv(
-        chip_size=args.CHIP_SIZE, num_tasks=args.NUM_TASKS, max_qubits_per_task=args.MAX_QUBITS_PER_TASK,
-        gnn_model=gnn_for_task_gen, device=device, gate_times=gate_times, reward_weights=args.REWARD_WEIGHTS
-    )
-    env_qumc.task_pool = fixed_task_pool
-    env_qumc.reset()  # 确保内部状态正确
+    print("\n" + "=" * 20 + " EVALUATION TASK SET " + "=" * 20)
+    # ... (打印任务信息) ...
 
-    qumc_plan = run_qumc_heuristic_scheduler(env_qumc)
-    qumc_results = calculate_metrics(qumc_plan)
+    # --- 实例化所有要对比的调度器 ---
+    schedulers_to_run = [
+        QuMCScheduler(),
+        RLScheduler(
+            model_path=script_args.model_path,
+            gnn_selector_path=script_args.gnn_selector_path,
+            args=args
+        )
+    ]
 
-    # --- 3. 运行 RL 调度器 ---
-    # 创建另一个干净的环境实例
-    env_rl = QuantumSchedulingEnv(
-        chip_size=args.CHIP_SIZE, num_tasks=args.NUM_TASKS, max_qubits_per_task=args.MAX_QUBITS_PER_TASK,
-        gnn_model=gnn_for_task_gen, device=device, gate_times=gate_times, reward_weights=args.REWARD_WEIGHTS
-    )
-    env_rl.task_pool = fixed_task_pool
+    results = {}
+    plans = {}
 
-    rl_plan = run_rl_scheduler(
-        env_rl,
-        model_path="models/model_episode_49800.pth",  # <-- 请务必替换为您最好的RL模型路径
-        gnn_selector_path="models/gnn_selector_v0.pth",
-        args=args
-    )
-    rl_results = calculate_metrics(rl_plan)
+    for scheduler in schedulers_to_run:
+        env = QuantumSchedulingEnv(
+            chip_size=args.CHIP_SIZE, num_tasks=args.NUM_TASKS, max_qubits_per_task=args.MAX_QUBITS_PER_TASK,
+            gnn_model=gnn_for_task_gen, device=device, gate_times=gate_times, reward_weights=args.REWARD_WEIGHTS
+        )
+        env.task_pool = fixed_task_pool
 
-    # --- 4. 打印、保存和可视化对比结果 ---
+        plan = scheduler.schedule(env)
+        results[scheduler.name] = calculate_metrics(plan)
+        plans[scheduler.name] = plan
+
+    # --- 打印和保存对比结果 ---
     print("\n\n" + "=" * 25 + " COMPARISON RESULTS " + "=" * 25)
-    print(f"| Metric                | QuMC Heuristic | RL Scheduler   | Improvement (%) |")
-    print(f"|-----------------------|----------------|----------------|-----------------|")
+    header = f"| {'Metric':<21} |" + "".join([f" {name:<14} |" for name in results.keys()])
+    print(header)
+    print(f"|{'-' * 23}|" + "".join([f"{'-' * 16}|" for name in results.keys()]))
 
-    # Makespan
-    imp_mk = (qumc_results['makespan'] - rl_results['makespan']) / qumc_results['makespan'] * 100 if qumc_results[
-                                                                                                         'makespan'] > 0 else 0
-    print(
-        f"| Makespan (us)         | {qumc_results['makespan']:>14.2f} | {rl_results['makespan']:>14.2f} | {imp_mk:>14.2f}% |")
+    for metric in results[list(results.keys())[0]]:
+        row = f"| {metric:<21} |"
+        for name in results.keys():
+            value = results[name][metric]
+            row += f" {value:>14.4f} |"
+        print(row)
+    print("=" * len(header))
 
-    # SWAPs
-    imp_sw = (qumc_results['avg_swaps'] - rl_results['avg_swaps']) / qumc_results['avg_swaps'] * 100 if qumc_results[
-                                                                                                            'avg_swaps'] > 0 else 0
-    print(
-        f"| Avg SWAPs per Task    | {qumc_results['avg_swaps']:>14.2f} | {rl_results['avg_swaps']:>14.2f} | {imp_sw:>14.2f}% |")
-
-    # Fidelity
-    imp_fid = (rl_results['avg_fidelity'] - qumc_results['avg_fidelity']) / qumc_results['avg_fidelity'] * 100 if \
-    qumc_results['avg_fidelity'] > 0 else 0
-    print(
-        f"| Avg Task Fidelity     | {qumc_results['avg_fidelity']:>14.4f} | {rl_results['avg_fidelity']:>14.4f} | {imp_fid:>14.2f}% |")
-
-    # Crosstalk
-    imp_ct = (qumc_results['total_crosstalk'] - rl_results['total_crosstalk']) / qumc_results[
-        'total_crosstalk'] * 100 if qumc_results['total_crosstalk'] > 0 else 0
-    print(
-        f"| Total Crosstalk Score | {qumc_results['total_crosstalk']:>14.2f} | {rl_results['total_crosstalk']:>14.2f} | {imp_ct:>14.2f}% |")
-
-    print("=" * 71)
-
-    # 创建一个唯一的评估结果目录
+    # --- 保存和可视化 ---
     eval_timestamp = time.strftime("%Y%m%d-%H%M%S")
     eval_dir = f"results/evaluation_{eval_timestamp}"
     os.makedirs(eval_dir, exist_ok=True)
 
-    # 保存结果到JSON文件
-    comparison_data = {"qumc_heuristic": qumc_results, "rl_scheduler": rl_results}
     with open(os.path.join(eval_dir, "comparison.json"), "w") as f:
-        json.dump(comparison_data, f, indent=4)
+        json.dump(results, f, indent=4)
     print(f"\nComparison data saved to {os.path.join(eval_dir, 'comparison.json')}")
 
-    # 保存对比图
     plot_path = os.path.join(eval_dir, "schedule_comparison.png")
-    plot_comparison(rl_plan, qumc_plan, args.CHIP_SIZE, save_path=plot_path)
+    plot_comparison(plans.get("Reinforcement Learning Scheduler", []), plans.get("QuMC-style Heuristic", []),
+                    args.CHIP_SIZE, save_path=plot_path)
