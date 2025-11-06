@@ -3,6 +3,7 @@ import argparse
 import time
 from typing import Dict
 
+from task_generate import TaskGenerator
 import torch
 import numpy as np
 import networkx as nx
@@ -144,8 +145,7 @@ class QuMCScheduler(BaseScheduler):
                     "start_time": batch_start_time, "end_time": batch_start_time + duration,
                     "num_swaps": num_swaps,
                     "final_fidelity": env._estimate_swaps_and_fidelity(task, mapping)[1],
-                    "crosstalk_score": calculate_crosstalk_test(mapping, batch_start_time, batch_start_time + duration,
-                                                                schedule_plan)
+                    "crosstalk_score": env._calculate_crosstalk(mapping, batch_start_time, batch_start_time + duration)
                 })
                 pbar.update(1)
 
@@ -306,12 +306,16 @@ if __name__ == '__main__':
         chip_size=args.CHIP_SIZE, num_tasks=args.NUM_TASKS, max_qubits_per_task=args.MAX_QUBITS_PER_TASK,
         gnn_model=gnn_for_task_gen, device=device, gate_times=gate_times, reward_weights=args.REWARD_WEIGHTS
     )
-    temp_env.task_generator.build_large_task_pool(100)
-    fixed_task_pool = temp_env.task_generator.get_episode_tasks(args.NUM_TASKS)
-
+    temp_task_generator = TaskGenerator(gate_times, gnn_for_task_gen, device)
+    fixed_task_pool = temp_task_generator.get_episode_tasks(args.NUM_TASKS, pool='test')
+    
     print("\n" + "=" * 20 + " EVALUATION TASK SET " + "=" * 20)
+    task_ids = sorted(list(fixed_task_pool.keys()))
     # ... (打印任务信息) ...
-
+    for tid in task_ids:
+        task = fixed_task_pool[tid]
+        print(f"  - Task {tid}: {task.num_qubits} qubits, {task.depth} depth, {task.interaction_graph.number_of_edges()} CNOTs")
+    print("="*63)
     # --- 实例化所有要对比的调度器 ---
     schedulers_to_run = [
         QuMCScheduler(),

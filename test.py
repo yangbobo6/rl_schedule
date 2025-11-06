@@ -11,7 +11,7 @@ import json
 import matplotlib
 import time
 
-from train_selector import SiameseGNNSelector
+from models.selector import SiameseGNNSelector
 
 # 设置matplotlib后端为'Agg'，以避免在无GUI的环境中出错
 matplotlib.use('Agg')
