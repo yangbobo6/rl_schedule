@@ -19,7 +19,8 @@ from models.gnn_encoder import GNNEncoder, networkx_to_pyg_data
 from models.actor_critic import TransformerActorCritic
 from models.selector import SiameseGNNSelector
 from run import Hyperparameters  # 从run.py导入超参数类
-from visualizer import plot_comparison
+from visualizer import plot_all_schedules
+
 
 # ==============================================================================
 # SECTION 1: 调度器算法的实现
@@ -98,7 +99,7 @@ class QuMCScheduler(BaseScheduler):
 
     def schedule(self, env: QuantumSchedulingEnv) -> list:
         print(f"\n--- Running {self.name} ---")
-        env.reset()
+        # env.reset()
 
         all_tasks = list(env.task_pool.values())
         sorted_tasks = sorted(all_tasks, key=get_cnot_density, reverse=True)
@@ -109,48 +110,84 @@ class QuMCScheduler(BaseScheduler):
         batch_start_time = 0.0
 
         while remaining_tasks:
-            batch_to_schedule, temp_used_qubits, tasks_for_next_round = [], set(), []
+            # --- 阶段一：构建一个并行的任务批次 ---
+            batch_to_schedule_info = []  # 存储本批次任务的详细信息
+            temp_used_qubits_ids = set()
+            tasks_for_next_batch = []
 
+            # 尝试将剩余任务装入当前并行批次
             for task in remaining_tasks:
-                available_qubits_count = env.num_qubits - len(temp_used_qubits)
+                available_qubits_count = env.num_qubits - len(temp_used_qubits_ids)
                 if available_qubits_count < task.num_qubits:
-                    tasks_for_next_round.append(task)
+                    tasks_for_next_batch.append(task)
                     continue
 
-                best_partition = self._find_best_partition(task, env, temp_used_qubits)
+                # 使用各自的策略寻找最佳分区
+                best_partition = self._find_best_partition(task, env, temp_used_qubits_ids)
 
                 if best_partition:
                     mapping, num_swaps = self._map_to_partition(task, best_partition, env)
-                    batch_to_schedule.append({'task': task, 'mapping': mapping, 'swaps': num_swaps})
-                    temp_used_qubits.update(best_partition)
+                    # 将本批次任务的信息存起来，供后续计算
+                    batch_to_schedule_info.append({
+                        'task': task,
+                        'mapping': mapping,
+                        'swaps': num_swaps
+                    })
+                    temp_used_qubits_ids.update(best_partition)
                 else:
-                    tasks_for_next_round.append(task)
+                    # 如果找不到分区，留到下一批次
+                    tasks_for_next_batch.append(task)
 
-            if not batch_to_schedule:
-                if remaining_tasks: print(
-                    f"Warning: Deadlock in QuMC, {len(remaining_tasks)} tasks cannot be scheduled.")
-                break
+            if not batch_to_schedule_info:
+                if tasks_for_next_batch:
+                    pbar.write(
+                        f"Warning: Deadlock in {self.name}, {len(tasks_for_next_batch)} tasks cannot be scheduled.")
+                break  # 结束循环
 
+            # --- 阶段二：计算本批次的时间和串扰，并更新调度计划 ---
+            # a. 计算本批次所有任务的最终时长和批次的最大时长
             max_batch_duration = 0
-            current_batch_plan = []
-            for item in batch_to_schedule:
-                task, mapping, num_swaps = item['task'], item['mapping'], item['swaps']
-                duration = task.estimated_duration + num_swaps * (env.swap_penalty["duration"] / 1e3)
+            for item in batch_to_schedule_info:
+                duration = item['task'].estimated_duration + item['swaps'] * (env.swap_penalty["duration"] / 1e3)
+                item['duration'] = duration
                 max_batch_duration = max(max_batch_duration, duration)
-                current_batch_plan.append((task, mapping, num_swaps, duration))
 
-            for task, mapping, num_swaps, duration in current_batch_plan:
+            # b. 为批次中的每个任务计算指标并添加到总计划
+            for i, item in enumerate(batch_to_schedule_info):
+                task = item['task']
+                mapping = item['mapping']
+                num_swaps = item['swaps']
+                duration = item['duration']
+
+                # 计算批次内的串扰
+                crosstalk_within_batch = 0
+                # 将当前任务的映射与其他所有本批次任务的映射进行比较
+                for j, other_item in enumerate(batch_to_schedule_info):
+                    if i == j: continue  # 不和自己比较
+
+                    other_mapping = other_item['mapping']
+                    # 检查物理邻接
+                    for p_id1 in mapping.values():
+                        for p_id2 in other_mapping.values():
+                            if p_id2 in env.chip_model[p_id1].connectivity:
+                                crosstalk_within_batch += env.chip_model[p_id1].connectivity[p_id2]['crosstalk_coeff']
+
+                # 计算保真度
+                fidelity = env._estimate_swaps_and_fidelity(task, mapping)[1]
+
                 schedule_plan.append({
-                    "task_id": task.id, "mapping": mapping,
-                    "start_time": batch_start_time, "end_time": batch_start_time + duration,
+                    "task_id": task.id,
+                    "mapping": mapping,
+                    "start_time": batch_start_time,
+                    "end_time": batch_start_time + duration,
                     "num_swaps": num_swaps,
-                    "final_fidelity": env._estimate_swaps_and_fidelity(task, mapping)[1],
-                    "crosstalk_score": env._calculate_crosstalk(mapping, batch_start_time, batch_start_time + duration)
+                    "final_fidelity": fidelity,
+                    "crosstalk_score": crosstalk_within_batch  # <-- 使用正确计算的值
                 })
                 pbar.update(1)
 
             batch_start_time += max_batch_duration
-            remaining_tasks = tasks_for_next_round
+            remaining_tasks = tasks_for_next_batch
 
         pbar.close()
         return schedule_plan
@@ -202,7 +239,7 @@ class RLScheduler(BaseScheduler):
         rl_placer.load_state_dict(torch.load(self.model_path, map_location=self.device))
         rl_placer.eval()
 
-        env.reset()
+        # env.reset()
 
         with torch.no_grad():
             for _ in tqdm(range(env.num_tasks), desc="RL Scheduler"):
@@ -271,6 +308,303 @@ class RLScheduler(BaseScheduler):
         return env.schedule_plan
 
 
+class SequentialScheduler(BaseScheduler):
+    """
+    一个更智能的串行调度器。
+    它按CNOT密度对任务进行排序，并在每一步为当前任务寻找芯片上可用的最佳分区进行映射。
+    所有任务严格按顺序执行，一个接一个。
+    """
+
+    def __init__(self):
+        super().__init__("Intelligent Sequential")
+
+    def schedule(self, env: QuantumSchedulingEnv) -> list:
+        print(f"\n--- Running {self.name} Scheduler ---")
+        # env.reset()
+
+        all_tasks = list(env.task_pool.values())
+
+        # 1. 任务排序：按CNOT密度从高到低排序
+        sorted_tasks = sorted(all_tasks, key=get_cnot_density, reverse=True)
+
+        schedule_plan = []
+        current_time = 0.0
+
+        pbar = tqdm(total=len(sorted_tasks), desc="Intelligent Sequential")
+        for task in sorted_tasks:
+
+            # 2. 寻找最佳分区
+            # 因为是串行执行，所以在为当前任务寻找分区时，整个芯片都是“可用”的。
+            # 我们不需要传递 used_qubits_ids，或者传递一个空集合。
+            best_partition = self._find_best_partition(task, env, used_qubits_ids=set())
+
+            if not best_partition:
+                print(f"Warning (Sequential): Could not find a valid partition for task {task.id}. Skipping.")
+                pbar.update(1)
+                continue
+
+            # 3. 在找到的最佳分区内进行映射
+            mapping, num_swaps = self._map_to_partition(task, best_partition, env)
+
+            # 4. 计算时间并添加到调度计划
+            # 核心逻辑：下一个任务的开始时间 = 上一个任务的结束时间
+            start_time = current_time
+            duration = task.estimated_duration + num_swaps * (env.swap_penalty["duration"] / 1e3)
+            end_time = start_time + duration
+
+            # 计算物理指标
+            final_fidelity = env._estimate_swaps_and_fidelity(task, mapping)[1]
+            # 串行执行没有并行串扰
+            crosstalk_score = 0
+
+            schedule_plan.append({
+                "task_id": task.id, "mapping": mapping,
+                "start_time": start_time, "end_time": end_time,
+                "num_swaps": num_swaps,
+                "final_fidelity": final_fidelity,
+                "crosstalk_score": crosstalk_score
+            })
+
+            # 更新时间，为下一个任务做准备
+            current_time = end_time
+            pbar.update(1)
+
+        pbar.close()
+        return schedule_plan
+
+    # --- 复用 QuMC 的辅助方法 ---
+    # 这两个方法可以作为SequentialScheduler的私有方法，或者定义在全局
+    def _find_best_partition(self, task, env, used_qubits_ids):
+        # (此处的代码与您之前实现的 QuMCScheduler._find_best_partition 完全相同)
+        best_partition = None
+        best_score = -float('inf')
+
+        for start_node_id in env.chip_model.keys():
+            if start_node_id in used_qubits_ids:
+                continue
+
+            partition_nodes = {start_node_id}
+
+            while len(partition_nodes) < task.num_qubits:
+                boundary_neighbors = set()
+                for node_in_partition in partition_nodes:
+                    for neighbor_id in env.chip_model[node_in_partition].connectivity:
+                        if neighbor_id not in partition_nodes and neighbor_id not in used_qubits_ids:
+                            boundary_neighbors.add(neighbor_id)
+
+                if not boundary_neighbors: break
+
+                best_neighbor = max(boundary_neighbors, key=lambda nid: env.chip_model[nid].fidelity_1q, default=None)
+
+                if best_neighbor:
+                    partition_nodes.add(best_neighbor)
+                else:
+                    break
+
+            if len(partition_nodes) == task.num_qubits:
+                partition_score = sum(env.chip_model[nid].fidelity_1q for nid in partition_nodes)
+                if partition_score > best_score:
+                    best_score = partition_score
+                    best_partition = list(partition_nodes)
+        return best_partition
+
+    def _map_to_partition(self, task, partition, env):
+        # (此处的代码与您之前实现的 QuMCScheduler._map_to_partition 完全相同)
+        mapping, num_swaps = {}, 0
+        sorted_logical = sorted(task.interaction_graph.degree, key=lambda x: x[1], reverse=True)
+        available_physical = list(partition)
+
+        for logical_id, _ in sorted_logical:
+            best_physical_id, min_cost = None, float('inf')
+
+            for physical_id in available_physical:
+                cost = sum(1 for pl, pp in mapping.items() if
+                           task.interaction_graph.has_edge(logical_id, pl) and physical_id not in env.chip_model[
+                               pp].connectivity)
+                if cost < min_cost:
+                    min_cost, best_physical_id = cost, physical_id
+
+            if best_physical_id:
+                mapping[logical_id] = best_physical_id
+                available_physical.remove(best_physical_id)
+                num_swaps += min_cost
+        return mapping, num_swaps
+
+
+import itertools  # 需要导入itertools
+
+class GreedyScheduler(BaseScheduler):
+    """
+    一个基于GSP (Greedy Sub-graph Partition) 思想的并行调度器。
+    1. 按CNOT密度对任务排序。
+    2. 分批次调度，尝试在每个批次中放入尽可能多的任务。
+    3. 在为任务分配资源时，遍历所有可能的连通子图（分区），
+       并选择一个成本分数最低的分区。
+    """
+
+    def __init__(self):
+        super().__init__("GSP-based Greedy")
+
+    def _calculate_partition_score(self, partition_nodes, task, env):
+        """
+        计算一个给定分区的成本分数，模拟论文中的Score_g。
+        Score = L + Avg_CNOT * #CNOTs + Sum(R_Qi)
+        """
+        partition_graph = env.hardware_graph.subgraph(partition_nodes)
+
+        # 1. 计算直径 (L)
+        try:
+            diameter = nx.diameter(partition_graph.to_undirected())
+        except nx.NetworkXError:  # 如果图不连通
+            return float('inf')
+
+        # 2. 计算分区内的平均CNOT错误率 (Avg_CNOT)
+        cnot_error_sum = 0
+        num_links = 0
+        for u, v in partition_graph.edges():
+            link_fid = env.chip_model[u].connectivity.get(v, {}).get('fidelity_2q', 0.95)
+            cnot_error_sum += (1.0 - link_fid)
+            num_links += 1
+        avg_cnot_error = cnot_error_sum / num_links if num_links > 0 else 1.0
+
+        # 3. 计算分区内的总读出错误率 (Sum(R_Qi))
+        sum_readout_error = sum(1.0 - env.chip_model[nid].fidelity_readout for nid in partition_nodes)
+
+        # 4. 获取任务的CNOT数量
+        num_task_cnots = task.interaction_graph.number_of_edges()
+
+        # 综合分数 (越小越好)
+        score = diameter + avg_cnot_error * num_task_cnots + sum_readout_error
+        return score
+
+    def _find_best_partition_gsp(self, task, env, used_qubits_ids):
+        """
+        遍历所有可能的连通子图，找到分数最低的最佳分区。
+        """
+        best_partition = None
+        min_score = float('inf')
+
+        available_nodes = [nid for nid in env.chip_model.keys() if nid not in used_qubits_ids]
+        if len(available_nodes) < task.num_qubits:
+            return None
+
+        # 遍历所有可能的、与任务大小相同的物理比特组合
+        for partition_candidate_nodes in itertools.combinations(available_nodes, task.num_qubits):
+            # 检查这个组合是否在物理上是连通的
+            subgraph = env.hardware_graph.subgraph(partition_candidate_nodes)
+            if not nx.is_connected(subgraph.to_undirected()):
+                continue
+
+            # 计算这个候选分区的分数
+            score = self._calculate_partition_score(partition_candidate_nodes, task, env)
+
+            if score < min_score:
+                min_score = score
+                best_partition = list(partition_candidate_nodes)
+
+        return best_partition
+
+    def schedule(self, env: QuantumSchedulingEnv) -> list:
+        print(f"\n--- Running {self.name} ---")
+        # env.reset()
+
+        all_tasks = list(env.task_pool.values())
+        sorted_tasks = sorted(all_tasks, key=get_cnot_density, reverse=True)
+
+        schedule_plan = []
+        remaining_tasks = list(sorted_tasks)
+        pbar = tqdm(total=len(all_tasks), desc=self.name)
+        batch_start_time = 0.0
+
+        while remaining_tasks:
+            batch_to_schedule, temp_used_qubits, tasks_for_next_round = [], set(), []
+
+            # 尝试将剩余任务装入当前并行批次
+            for task in remaining_tasks:
+                # 使用GSP算法在剩余的比特上寻找最佳分区
+                best_partition = self._find_best_partition_gsp(task, env, temp_used_qubits)
+
+                if best_partition:
+                    # 在分区内进行映射 (可以复用之前的逻辑)
+                    mapping, num_swaps = self._map_to_partition(task, best_partition, env)
+                    batch_to_schedule.append({'task': task, 'mapping': mapping, 'swaps': num_swaps})
+                    temp_used_qubits.update(best_partition)
+                else:
+                    # 如果找不到分区，留到下一批次
+                    tasks_for_next_round.append(task)
+
+            if not batch_to_schedule:
+                if remaining_tasks:
+                    print(f"Warning: GSP Greedy couldn't place {len(remaining_tasks)} tasks.")
+                break
+
+            # 调度这个批次的所有任务
+            max_batch_duration = 0
+            batch_plan_items = []
+            for item in batch_to_schedule:
+                task, mapping, num_swaps = item['task'], item['mapping'], item['swaps']
+                duration = task.estimated_duration + num_swaps * (env.swap_penalty["duration"] / 1e3)
+                max_batch_duration = max(max_batch_duration, duration)
+                batch_plan_items.append({
+                    'task': task, 'mapping': mapping, 'num_swaps': num_swaps, 'duration': duration
+                })
+
+                # 现在，为批次中的每个任务计算串扰
+                for i, item in enumerate(batch_plan_items):
+                    task = item['task']
+                    mapping = item['mapping']
+                    duration = item['duration']
+
+                    # 计算与“本批次内其他任务”的串扰
+                    crosstalk_within_batch = 0
+                    for j, other_item in enumerate(batch_plan_items):
+                        if i == j: continue
+                        other_mapping = other_item['mapping']
+                        # 检查时间重叠 (在本批次内，时间总是重叠的)
+                        # 检查物理邻接
+                        for p_id1 in mapping.values():
+                            for p_id2 in other_mapping.values():
+                                if p_id2 in env.chip_model[p_id1].connectivity:
+                                    crosstalk_within_batch += env.chip_model[p_id1].connectivity[p_id2]['crosstalk_coeff']
+
+                    schedule_plan.append({
+                        "task_id": task.id,
+                        "mapping": mapping,
+                        "start_time": batch_start_time,
+                        "end_time": batch_start_time + duration,
+                        "num_swaps": item['num_swaps'],
+                        "final_fidelity": env._estimate_swaps_and_fidelity(task, mapping)[1],
+                        "crosstalk_score": crosstalk_within_batch  # <-- 使用正确计算的值
+                    })
+                pbar.update(1)
+
+            batch_start_time += max_batch_duration
+            remaining_tasks = tasks_for_next_round
+
+        pbar.close()
+        return schedule_plan
+
+    def _map_to_partition(self, task, partition, env):
+        # (这个方法的代码与 SequentialScheduler 中的完全相同)
+        mapping, num_swaps = {}, 0
+        sorted_logical = sorted(task.interaction_graph.degree, key=lambda x: x[1], reverse=True)
+        available_physical = list(partition)
+
+        for logical_id, _ in sorted_logical:
+            best_physical_id, min_cost = None, float('inf')
+
+            for physical_id in available_physical:
+                cost = sum(1 for pl, pp in mapping.items() if
+                           task.interaction_graph.has_edge(logical_id, pl) and physical_id not in env.chip_model[
+                               pp].connectivity)
+                if cost < min_cost:
+                    min_cost, best_physical_id = cost, physical_id
+
+            if best_physical_id:
+                mapping[logical_id] = best_physical_id
+                available_physical.remove(best_physical_id)
+                num_swaps += min_cost
+        return mapping, num_swaps
 
 # ==============================================================================
 # SECTION 2: 主评估逻辑
@@ -318,6 +652,8 @@ if __name__ == '__main__':
     print("="*63)
     # --- 实例化所有要对比的调度器 ---
     schedulers_to_run = [
+        SequentialScheduler(),
+        GreedyScheduler(),
         QuMCScheduler(),
         RLScheduler(
             model_path=script_args.model_path,
@@ -334,35 +670,46 @@ if __name__ == '__main__':
             chip_size=args.CHIP_SIZE, num_tasks=args.NUM_TASKS, max_qubits_per_task=args.MAX_QUBITS_PER_TASK,
             gnn_model=gnn_for_task_gen, device=device, gate_times=gate_times, reward_weights=args.REWARD_WEIGHTS
         )
-        env.task_pool = fixed_task_pool
 
+        env.reset(fixed_task_pool=fixed_task_pool)
         plan = scheduler.schedule(env)
         results[scheduler.name] = calculate_metrics(plan)
         plans[scheduler.name] = plan
 
-    # --- 打印和保存对比结果 ---
-    print("\n\n" + "=" * 25 + " COMPARISON RESULTS " + "=" * 25)
-    header = f"| {'Metric':<21} |" + "".join([f" {name:<14} |" for name in results.keys()])
-    print(header)
-    print(f"|{'-' * 23}|" + "".join([f"{'-' * 16}|" for name in results.keys()]))
+        # --- 打印和保存对比结果 (这部分代码现在可以自动适应任意数量的调度器) ---
+        print("\n\n" + "=" * 30 + " FINAL COMPARISON RESULTS " + "=" * 30)
 
-    for metric in results[list(results.keys())[0]]:
-        row = f"| {metric:<21} |"
-        for name in results.keys():
-            value = results[name][metric]
-            row += f" {value:>14.4f} |"
-        print(row)
-    print("=" * len(header))
+        scheduler_names = list(results.keys())
+        header = f"| {'Metric':<21} |" + "".join([f" {name:<20} |" for name in scheduler_names])
+        print(header)
+        print(f"|{'-' * 23}|" + "".join([f"{'-' * 22}|" for name in scheduler_names]))
 
-    # --- 保存和可视化 ---
+        metrics_to_display = ["makespan", "avg_swaps", "avg_fidelity", "total_crosstalk"]
+        for metric in metrics_to_display:
+            row = f"| {metric:<21} |"
+            for name in scheduler_names:
+                value = results.get(name, {}).get(metric, 0)
+                row += f" {value:>20.4f} |"
+            print(row)
+        print("=" * len(header))
+
     eval_timestamp = time.strftime("%Y%m%d-%H%M%S")
     eval_dir = f"results/evaluation_{eval_timestamp}"
     os.makedirs(eval_dir, exist_ok=True)
 
+    # 保存JSON数据 (不变)
     with open(os.path.join(eval_dir, "comparison.json"), "w") as f:
-        json.dump(results, f, indent=4)
+        # 为了让JSON可读，我们需要处理mapping中的元组键
+        # (这是一个好的实践)
+        serializable_plans = {}
+        for name, plan in plans.items():
+            serializable_plans[name] = [
+                {k: (str(v) if isinstance(v, dict) else v) for k, v in item.items()}
+                for item in plan
+            ]
+        json.dump({"results": results, "plans": serializable_plans}, f, indent=4)
     print(f"\nComparison data saved to {os.path.join(eval_dir, 'comparison.json')}")
 
-    plot_path = os.path.join(eval_dir, "schedule_comparison.png")
-    plot_comparison(plans.get("Reinforcement Learning Scheduler", []), plans.get("QuMC-style Heuristic", []),
-                    args.CHIP_SIZE, save_path=plot_path)
+    # 调用新的绘图函数
+    plot_path = os.path.join(eval_dir, "schedule_comparison_all.png")
+    plot_all_schedules(plans, args.CHIP_SIZE, save_path=plot_path)

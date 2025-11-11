@@ -1,4 +1,5 @@
 import gymnasium as gym
+import networkx as nx
 from gymnasium import spaces
 import numpy as np
 from typing import List, Dict, Any, Tuple
@@ -29,6 +30,7 @@ class QuantumSchedulingEnv(gym.Env):
         self.num_tasks = num_tasks
         self.max_qubits_per_task = max_qubits_per_task  # 用于定义观察空间
         self.reward_weights = reward_weights
+        self.hardware_graph = nx.Graph()
 
         # --- GNN编码器 (用于将任务交互图编码为向量) ---
         # 在实际项目中，这会是一个预训练或端到端训练的PyTorch/TensorFlow模型
@@ -43,6 +45,11 @@ class QuantumSchedulingEnv(gym.Env):
         self.current_step = 0
         # 简化版SWAP估算器：假设每个SWAP门增加固定的时间和错误
         self.swap_penalty = {"duration": 3 * 350, "error": 0.03}  # 3个CX门
+
+        for qid, qubit in self.chip_model.items():
+            self.hardware_graph.add_node(qid)
+            for neighbor_id in qubit.connectivity:
+                self.hardware_graph.add_edge(qid, neighbor_id)
         
         # --- 可视化工具 ---
         self.visualizer = QuantumChipVisualizer(self.chip_model, self.chip_size)
@@ -336,7 +343,7 @@ class QuantumSchedulingEnv(gym.Env):
 
         return num_swaps, final_fidelity
 
-    def reset(self, seed=None, options=None) -> Tuple[Dict, Dict]:
+    def reset(self, seed=None, options=None, fixed_task_pool: dict = None):
         """
         重置环境，并动态地选择一个初始任务来生成合法的初始观察。
         """
@@ -347,17 +354,20 @@ class QuantumSchedulingEnv(gym.Env):
         if options and 'pool' in options:
             pool_name = options['pool']
 
-        # 调用TaskGenerator从指定池中获取任务
-        self.task_pool = self.task_generator.get_episode_tasks(self.num_tasks, pool=pool_name)
-
         self.current_step = 0
         self.schedule_plan = []
         for qubit in self.chip_model.values():
             qubit.reset()
 
-        # 2. 重新生成当次Episode的任务池，并动态选择初始任务
-        # 从大任务池中随机采样新的一组任务
-        self.task_pool = self.task_generator.get_episode_tasks(self.num_tasks)
+        if fixed_task_pool:
+            # 如果外部提供了固定的任务池，直接使用它
+            self.task_pool = fixed_task_pool
+        else:
+            # 否则，按原来的逻辑从TaskGenerator采样
+            pool_name = 'train'
+            if options and 'pool' in options:
+                pool_name = options['pool']
+            self.task_pool = self.task_generator.get_episode_tasks(self.num_tasks, pool=pool_name)
 
         # 重置新任务池中所有任务的状态
         for task in self.task_pool.values():
