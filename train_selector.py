@@ -1,4 +1,6 @@
 # 文件: train_selector.py
+import os
+import time
 
 import torch
 import torch.nn as nn
@@ -9,7 +11,7 @@ import pickle
 from tqdm import tqdm
 
 from models.gnn_encoder import GNNEncoder
-
+from torch.utils.tensorboard import SummaryWriter # <-- 导入
 
 class SiameseGNNSelector(nn.Module):
     """
@@ -50,7 +52,13 @@ def pyg_collate_fn(batch):
 def train_selector(dataset_path: str, model_save_path: str, epochs: int = 20):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    run_timestamp = time.strftime("%Y%m%d-%H%M%S")
+    log_dir = f"runs/gnn_selector_training_{run_timestamp}"
+    writer = SummaryWriter(log_dir)
+    print(f"TensorBoard logs will be saved in: {log_dir}")
+
     # 1. 加载数据集
+    print(f"Loading dataset from {dataset_path}...")
     with open(dataset_path, 'rb') as f:
         dataset = pickle.load(f)
 
@@ -60,6 +68,7 @@ def train_selector(dataset_path: str, model_save_path: str, epochs: int = 20):
 
     train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, collate_fn=pyg_collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=128, collate_fn=pyg_collate_fn)
+    print(f"Dataset loaded: {train_size} training samples, {val_size} validation samples.")
 
     # 2. 初始化模型
     model = SiameseGNNSelector(
@@ -72,10 +81,15 @@ def train_selector(dataset_path: str, model_save_path: str, epochs: int = 20):
 
     # 3. 训练循环
     print("Starting GNN Selector pre-training...")
+    best_val_loss = float('inf')
+
     for epoch in range(epochs):
         model.train()
-        total_loss = 0
-        for chip_batch, task_batch, label_batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}"):
+        total_train_loss = 0
+
+        # --- 训练阶段 ---
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs} [Train]")
+        for chip_batch, task_batch, label_batch in pbar:
             chip_batch, task_batch, label_batch = chip_batch.to(device), task_batch.to(device), label_batch.to(device)
 
             optimizer.zero_grad()
@@ -83,20 +97,52 @@ def train_selector(dataset_path: str, model_save_path: str, epochs: int = 20):
             loss = criterion(predictions, label_batch)
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
 
-        print(f"Epoch {epoch + 1} - Training Loss: {total_loss / len(train_loader):.4f}")
+            total_train_loss += loss.item()
+            pbar.set_postfix({"Train Loss": f"{loss.item():.4f}"})
 
-        # 验证... (省略以保持简洁)
+        avg_train_loss = total_train_loss / len(train_loader)
 
-    # 4. 保存模型
-    torch.save(model.state_dict(), model_save_path)
-    print(f"GNN Selector model saved to {model_save_path}")
+        # --- 记录训练Loss到TensorBoard ---
+        writer.add_scalar("Loss/train", avg_train_loss, epoch)
+
+        # --- 验证阶段 ---
+        model.eval()
+        total_val_loss = 0
+        with torch.no_grad():
+            for chip_batch, task_batch, label_batch in val_loader:
+                chip_batch, task_batch, label_batch = chip_batch.to(device), task_batch.to(device), label_batch.to(
+                    device)
+                predictions = model(chip_batch, task_batch)
+                loss = criterion(predictions, label_batch)
+                total_val_loss += loss.item()
+
+        avg_val_loss = total_val_loss / len(val_loader)
+
+        # --- 记录验证Loss到TensorBoard ---
+        writer.add_scalar("Loss/validation", avg_val_loss, epoch)
+
+        print(f"Epoch {epoch + 1} - Avg Train Loss: {avg_train_loss:.4f}, Avg Validation Loss: {avg_val_loss:.4f}")
+
+        # --- 保存最佳模型 ---
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            # 确保目录存在
+            model_dir = os.path.dirname(model_save_path)
+            if not os.path.exists(model_dir):
+                os.makedirs(model_dir)
+            torch.save(model.state_dict(), model_save_path)
+            print(f"  -> New best model saved to {model_save_path} (Val Loss: {best_val_loss:.4f})")
+
+    # 4. 关闭Writer
+    writer.close()
+    print("GNN Selector training finished.")
 
 
 if __name__ == '__main__':
     # 运行此脚本来训练GNN选择器
     train_selector(
         dataset_path="data/selector_pretrain_dataset.pkl",
-        model_save_path="models/gnn_selector_v0.pth"
+        model_save_path="models/gnn_selector_v0.pth",
+        epochs = 50  # 增加训练轮数以看到清晰的曲线
     )
