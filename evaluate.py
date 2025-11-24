@@ -173,7 +173,7 @@ class QuMCScheduler(BaseScheduler):
                                 crosstalk_within_batch += env.chip_model[p_id1].connectivity[p_id2]['crosstalk_coeff']
 
                 # 计算保真度
-                fidelity = env._estimate_swaps_and_fidelity(task, mapping)[1]
+                fidelity = env._estimate_swaps_and_fidelity(task, mapping,crosstalk_within_batch)[1]
 
                 schedule_plan.append({
                     "task_id": task.id,
@@ -353,7 +353,7 @@ class SequentialScheduler(BaseScheduler):
             end_time = start_time + duration
 
             # 计算物理指标
-            final_fidelity = env._estimate_swaps_and_fidelity(task, mapping)[1]
+            final_fidelity = env._estimate_swaps_and_fidelity(task, mapping,0)[1]
             # 串行执行没有并行串扰
             crosstalk_score = 0
 
@@ -573,7 +573,7 @@ class GreedyScheduler(BaseScheduler):
                         "start_time": batch_start_time,
                         "end_time": batch_start_time + duration,
                         "num_swaps": item['num_swaps'],
-                        "final_fidelity": env._estimate_swaps_and_fidelity(task, mapping)[1],
+                        "final_fidelity": env._estimate_swaps_and_fidelity(task, mapping,crosstalk_within_batch)[1],
                         "crosstalk_score": crosstalk_within_batch  # <-- 使用正确计算的值
                     })
                 pbar.update(1)

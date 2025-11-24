@@ -365,7 +365,6 @@ class QuantumSchedulingEnv(gym.Env):
         for p_id in mapping.values():
             f_1q = self.chip_model[p_id].fidelity_1q
             # 假设1Q门均匀分布在各比特上
-            print(task.num_1q_gates)
             avg_1q_ops_per_qubit = task.num_1q_gates / task.num_qubits
             error_1q += avg_1q_ops_per_qubit * (1.0 - f_1q)
 
