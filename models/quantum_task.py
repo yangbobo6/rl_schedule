@@ -6,7 +6,7 @@ class QuantumTask:
     """代表一个量子线路任务"""
 
     def __init__(self, task_id: int, num_qubits: int, depth: int, shots: int,
-                 interaction_graph: nx.Graph, estimated_duration: float,graph_embedding: np.ndarray):
+                 interaction_graph: nx.Graph, estimated_duration: float,graph_embedding: np.ndarray,num_1q_gates=0, num_2q_gates=0):
         self.id = task_id
         self.is_scheduled = False
         self.num_qubits = num_qubits
@@ -15,6 +15,8 @@ class QuantumTask:
         self.interaction_graph = interaction_graph
         self.estimated_duration = estimated_duration
         self.graph_embedding = graph_embedding
+        self.num_1q_gates = num_1q_gates
+        self.num_2q_gates = num_2q_gates
 
     # 暂时没用到
     def _generate_random_graph(self) -> nx.Graph:

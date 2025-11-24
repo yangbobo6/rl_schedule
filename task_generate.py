@@ -133,6 +133,20 @@ class TaskGenerator:
         depth = decomposed_circuit.depth()
         shots = 1024
 
+        gate_counts = decomposed_circuit.count_ops()
+        num_1q_gates = 0
+        num_2q_gates = 0
+
+        # 遍历统计
+        for gate_name, count in gate_counts.items():
+            if gate_name in ['cx', 'cz', 'ecr']:  # 常见的2Q门
+                num_2q_gates += count
+            elif gate_name in ['measure', 'barrier', 'id']:
+                pass  # 测量和辅助指令通常单独算或忽略
+            else:
+                # 假设其他都是1Q门 (u1, u2, u3, sx, x, rz...)
+                num_1q_gates += count
+
         # --- c. 构建交互图 (Interaction Graph) ---
         interaction_graph = nx.Graph()
         interaction_graph.add_nodes_from(range(num_qubits))
@@ -183,7 +197,9 @@ class TaskGenerator:
             shots=shots,
             interaction_graph=interaction_graph,
             graph_embedding=graph_embedding,
-            estimated_duration=total_duration / 1e3  # 转换为微秒 (us)
+            estimated_duration=total_duration / 1e3,  # 转换为微秒 (us)
+            num_1q_gates=num_1q_gates,
+            num_2q_gates=num_2q_gates
         )
         return task
 

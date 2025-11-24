@@ -318,28 +318,64 @@ class QuantumSchedulingEnv(gym.Env):
             "logical_qubit_context": logical_qubit_context
         }
 
-    def _estimate_swaps_and_fidelity(self, task: QuantumTask, mapping: Dict) -> Tuple[int, float]:
+    def _estimate_swaps_and_fidelity(self, task: QuantumTask, mapping: Dict, crosstalk_error: float) -> Tuple[int, float]:
         """
-        辅助函数：估算给定映射所需的SWAP数量和最终保真度。
+        基于物理模型计算保真度。
+        Total_Error = Err_1Q + Err_2Q + Err_SWAP + Err_Crosstalk
+        Fidelity = exp(-Total_Error)
         """
+        # 1. 计算 SWAP 数量 (保持原有逻辑)
         num_swaps = 0
         graph = task.interaction_graph
 
-        # 遍历任务交互图中的每一条边（代表一个2Q门需求）
+        # 用于计算平均链路质量，用于估算SWAP带来的错误
+        path_error_sum = 0
+        path_count = 0
+
+        # 2. 计算原生 2Q 门错误 (Err_2Q)
+        error_2q_native = 0.0
+
         for u, v in graph.edges():
             p_u, p_v = mapping[u], mapping[v]
-            # 如果物理上不相邻，就需要SWAP
-            if p_v not in self.chip_model[p_u].connectivity:
-                # 这是一个简化的估算，实际的SWAP数量取决于路由算法
-                # 我们这里简单地认为每条不满足的边都需要一次SWAP
-                num_swaps += 1
 
-        # 估算保真度
-        # 1. 基础保真度，来自所选比特
-        avg_f1q = np.mean([self.chip_model[pid].fidelity_1q for pid in mapping.values()])
-        # 2. 考虑门操作和SWAP引入的错误
-        total_error = task.depth * (1 - avg_f1q) + num_swaps * self.swap_penalty["error"]
-        final_fidelity = np.exp(-total_error)  # 一个常用的近似模型
+            if p_v in self.chip_model[p_u].connectivity:
+                # 如果物理相连，直接累加该链路的错误率
+                f_2q = self.chip_model[p_u].connectivity[p_v]['fidelity_2q']
+                error_2q_native += (1.0 - f_2q)
+
+                path_error_sum += (1.0 - f_2q)
+                path_count += 1
+            else:
+                # 如果不相连，需要SWAP
+                num_swaps += 1
+                # 这里简单假设SWAP发生在“平均质量”的链路上
+                # 更精确的做法是运行路由算法(Routing)，但这太慢
+                pass
+
+        # 估算分区的平均2Q错误率，用于SWAP
+        avg_2q_error = path_error_sum / path_count if path_count > 0 else 0.01
+
+        # 3. 计算 SWAP 错误 (Err_SWAP)
+        # 1个SWAP通常由3个CNOT组成
+        error_swap = num_swaps * 3 * avg_2q_error
+
+        # 4. 计算 1Q 门错误 (Err_1Q)
+        # 遍历所有被使用的物理比特
+        error_1q = 0.0
+        for p_id in mapping.values():
+            f_1q = self.chip_model[p_id].fidelity_1q
+            # 假设1Q门均匀分布在各比特上
+            print(task.num_1q_gates)
+            avg_1q_ops_per_qubit = task.num_1q_gates / task.num_qubits
+            error_1q += avg_1q_ops_per_qubit * (1.0 - f_1q)
+
+        # 5. 汇总所有错误
+        # 注意：crosstalk_error 是直接加在总错误上的
+        # 因为 E_total = E_base + E_crosstalk
+        total_error = error_1q + error_2q_native + error_swap + crosstalk_error
+
+        # 计算最终保真度
+        final_fidelity = np.exp(-total_error)
 
         return num_swaps, final_fidelity
 
@@ -413,15 +449,20 @@ class QuantumSchedulingEnv(gym.Env):
         start_time = action["start_time"]
         mapping = action["mapping"]
 
+        duration_no_swap = task.estimated_duration
+        end_time_est = start_time + duration_no_swap  # 临时结束时间用于估算串扰
+
+        crosstalk_error_sum = self._calculate_crosstalk(mapping, start_time, end_time_est)
+
         # --- 3. 计算所有物理相关的指标 ---
         # a. 估算SWAP和基础保真度
-        num_swaps, base_fidelity = self._estimate_swaps_and_fidelity(task, mapping)
+        num_swaps, final_fidelity = self._estimate_swaps_and_fidelity(task, mapping, crosstalk_error_sum)
 
         # b. 计算因SWAP增加的额外时长
         duration_penalty_swap = num_swaps * self.swap_penalty["duration"] / 1e3  # us
 
         # c. 计算任务最终的总时长和结束时间
-        duration = task.estimated_duration + duration_penalty_swap
+        duration = duration_no_swap + duration_penalty_swap
         end_time = start_time + duration
 
         # d. 计算与已存在任务的串扰
@@ -435,7 +476,7 @@ class QuantumSchedulingEnv(gym.Env):
             "start_time": start_time,
             "end_time": end_time,
             "num_swaps": num_swaps,
-            "final_fidelity": base_fidelity,
+            "final_fidelity": final_fidelity,
             "crosstalk_score": crosstalk_score
         }
 
@@ -504,7 +545,7 @@ class QuantumSchedulingEnv(gym.Env):
         # 3>. 保真度奖励 (Fidelity Reward)
         # 保真度本身就在[0,1]区间，是一个很好的奖励
         min_acceptable_fidelity = 0.80
-        reward_fidelity = (base_fidelity - min_acceptable_fidelity) / (1.0 - min_acceptable_fidelity)
+        reward_fidelity = (final_fidelity - min_acceptable_fidelity) / (1.0 - min_acceptable_fidelity)
         reward_fidelity = np.clip(reward_fidelity, 0, 1.0)  # 裁剪到[0, 1]
 
         # 4>. 串扰惩罚 (Crosstalk Penalty)
