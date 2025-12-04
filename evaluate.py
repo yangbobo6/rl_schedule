@@ -19,7 +19,9 @@ from models.gnn_encoder import GNNEncoder, networkx_to_pyg_data
 from models.actor_critic import TransformerActorCritic
 from models.selector import SiameseGNNSelector
 from run import Hyperparameters  # 从run.py导入超参数类
-from visualizer import plot_all_schedules
+from qiskit import QuantumCircuit, transpile
+from qiskit.transpiler import CouplingMap, Layout
+from visualizer import plot_all_schedules, plot_chip_snapshot
 
 
 # ==============================================================================
@@ -38,9 +40,96 @@ class BaseScheduler:
         raise NotImplementedError
 
 
+def map_to_partition_sarbe(task, partition, env):
+        """
+        使用 Qiskit 的 SABRE 算法在指定分区内进行映射和路由。
+        完全模拟 QuMC 的 mapping transition 过程。
+        """
+        # 1. 重建 Qiskit 线路 (从交互图恢复)
+        # 我们需要一个真实的线路对象来运行 SABRE
+        qc = QuantumCircuit(task.num_qubits)
+        # 添加任务中的所有 CNOT 门 (逻辑连接)
+        for u, v in task.interaction_graph.edges():
+            qc.cx(u, v)
+
+        # 2. 构建分区的局部拓扑 (Coupling Map)
+        # 我们需要告诉 Qiskit 这个分区内部的连接情况
+        # 将物理ID列表映射为局部索引: 0, 1, ..., k-1
+        # partition 是 [pid1, pid2, ...]
+        local_idx_to_physical_id = {i: pid for i, pid in enumerate(partition)}
+
+        # 构建局部连接列表
+        partition_coupling_list = []
+        for i in range(len(partition)):
+            for j in range(len(partition)):
+                if i == j: continue
+                u_pid = local_idx_to_physical_id[i]
+                v_pid = local_idx_to_physical_id[j]
+
+                # 如果这两个物理比特在真实芯片上相连
+                if v_pid in env.chip_model[u_pid].connectivity:
+                    partition_coupling_list.append([i, j])
+
+        # 创建 Qiskit 的 CouplingMap 对象
+        if not partition_coupling_list and task.num_qubits > 1:
+            # 极端情况：如果分区不连通（理论上 GSP/QuMC 分区算法应避免这种情况）
+            # 回退到之前的贪心逻辑或返回一个大惩罚
+            return {}, 1000
+
+        pm_coupling = CouplingMap(partition_coupling_list)
+
+        # 3. 运行 Qiskit Transpile (SABRE 算法)
+        # layout_method='sabre': 寻找最佳初始映射
+        # routing_method='sabre': 插入最少的 SWAP
+        # optimization_level=3: 开启最高级别的优化
+        try:
+            transpiled_qc = transpile(
+                qc,
+                coupling_map=pm_coupling,
+                layout_method='sabre',
+                routing_method='sabre',
+                optimization_level=3
+            )
+        except Exception as e:
+            print(f"SABRE mapping failed: {e}. Using fallback.")
+            return {}, 1000
+
+        # 4. 提取结果
+        # a. 统计 SWAP 数量
+        # count_ops() 返回字典，例如 {'cx': 10, 'swap': 2, ...}
+        ops = transpiled_qc.count_ops()
+        num_swaps = ops.get('swap', 0)
+
+        # b. 提取映射关系
+        mapping = {}
+
+        if transpiled_qc.layout and transpiled_qc.layout.initial_layout:
+            virtual_bits = transpiled_qc.layout.initial_layout.get_virtual_bits()
+            for logical_qubit, local_physical_index in virtual_bits.items():
+                # 使用 qc.qubits.index 获取索引
+                try:
+                    logic_id = qc.qubits.index(logical_qubit)
+                except ValueError:
+                    continue  # 这是一个不在原线路中的 ancilla 比特，忽略
+
+                if logic_id < task.num_qubits:
+                    true_physical_id = local_idx_to_physical_id[local_physical_index]
+                    mapping[logic_id] = true_physical_id
+        else:
+            # Fallback
+            print("Warning: No layout found, using trivial mapping.")
+            for i in range(min(len(partition), task.num_qubits)):
+                mapping[i] = partition[i]
+
+        return mapping, num_swaps
+
+
+
+
 class QuMCScheduler(BaseScheduler):
-    def __init__(self):
+    def __init__(self, epsilon=0.1):
         super().__init__("QuMC-style Heuristic")
+        self.epsilon = epsilon  # 保真度差异阈值
 
     def _find_best_partition(self, task, env, used_qubits_ids):
         best_partition = None
@@ -75,7 +164,91 @@ class QuMCScheduler(BaseScheduler):
                     best_partition = list(partition_nodes)
         return best_partition
 
+
     def _map_to_partition(self, task, partition, env):
+        """
+        使用 Qiskit 的 SABRE 算法在指定分区内进行映射和路由。
+        完全模拟 QuMC 的 mapping transition 过程。
+        """
+        # 1. 重建 Qiskit 线路 (从交互图恢复)
+        # 我们需要一个真实的线路对象来运行 SABRE
+        qc = QuantumCircuit(task.num_qubits)
+        # 添加任务中的所有 CNOT 门 (逻辑连接)
+        for u, v in task.interaction_graph.edges():
+            qc.cx(u, v)
+
+        # 2. 构建分区的局部拓扑 (Coupling Map)
+        # 我们需要告诉 Qiskit 这个分区内部的连接情况
+        # 将物理ID列表映射为局部索引: 0, 1, ..., k-1
+        # partition 是 [pid1, pid2, ...]
+        local_idx_to_physical_id = {i: pid for i, pid in enumerate(partition)}
+
+        # 构建局部连接列表
+        partition_coupling_list = []
+        for i in range(len(partition)):
+            for j in range(len(partition)):
+                if i == j: continue
+                u_pid = local_idx_to_physical_id[i]
+                v_pid = local_idx_to_physical_id[j]
+
+                # 如果这两个物理比特在真实芯片上相连
+                if v_pid in env.chip_model[u_pid].connectivity:
+                    partition_coupling_list.append([i, j])
+
+        # 创建 Qiskit 的 CouplingMap 对象
+        if not partition_coupling_list and task.num_qubits > 1:
+            # 极端情况：如果分区不连通（理论上 GSP/QuMC 分区算法应避免这种情况）
+            # 回退到之前的贪心逻辑或返回一个大惩罚
+            return {}, 1000
+
+        pm_coupling = CouplingMap(partition_coupling_list)
+
+        # 3. 运行 Qiskit Transpile (SABRE 算法)
+        # layout_method='sabre': 寻找最佳初始映射
+        # routing_method='sabre': 插入最少的 SWAP
+        # optimization_level=3: 开启最高级别的优化
+        try:
+            transpiled_qc = transpile(
+                qc,
+                coupling_map=pm_coupling,
+                layout_method='sabre',
+                routing_method='sabre',
+                optimization_level=3
+            )
+        except Exception as e:
+            print(f"SABRE mapping failed: {e}. Using fallback.")
+            return {}, 1000
+
+        # 4. 提取结果
+        # a. 统计 SWAP 数量
+        # count_ops() 返回字典，例如 {'cx': 10, 'swap': 2, ...}
+        ops = transpiled_qc.count_ops()
+        num_swaps = ops.get('swap', 0)
+
+        # b. 提取映射关系
+        mapping = {}
+
+        if transpiled_qc.layout and transpiled_qc.layout.initial_layout:
+            virtual_bits = transpiled_qc.layout.initial_layout.get_virtual_bits()
+            for logical_qubit, local_physical_index in virtual_bits.items():
+                # 使用 qc.qubits.index 获取索引
+                try:
+                    logic_id = qc.qubits.index(logical_qubit)
+                except ValueError:
+                    continue  # 这是一个不在原线路中的 ancilla 比特，忽略
+
+                if logic_id < task.num_qubits:
+                    true_physical_id = local_idx_to_physical_id[local_physical_index]
+                    mapping[logic_id] = true_physical_id
+        else:
+            # Fallback
+            print("Warning: No layout found, using trivial mapping.")
+            for i in range(min(len(partition), task.num_qubits)):
+                mapping[i] = partition[i]
+
+        return mapping, num_swaps
+
+    def _map_to_partition_old(self, task, partition, env):
         mapping = {}
         num_swaps = 0
         sorted_logical = sorted(task.interaction_graph.degree, key=lambda x: x[1], reverse=True)
@@ -175,6 +348,20 @@ class QuMCScheduler(BaseScheduler):
                 # 计算保真度
                 fidelity = env._estimate_swaps_and_fidelity(task, mapping,crosstalk_within_batch)[1]
 
+                # --- 计算细粒度保真度指标 ---
+                # 1. 平均单比特门保真度
+                avg_f1q_used = np.mean([env.chip_model[pid].fidelity_1q for pid in mapping.values()])
+
+                # 2. 平均双比特门保真度
+                used_links_f2q = []
+                for u, v in task.interaction_graph.edges():
+                    p_u, p_v = mapping[u], mapping[v]
+                    # 只有物理相连的边才有 f2q，不相连的边需要SWAP (其错误在 num_swaps 中体现)
+                    if p_v in env.chip_model[p_u].connectivity:
+                        used_links_f2q.append(env.chip_model[p_u].connectivity[p_v]['fidelity_2q'])
+
+                avg_f2q_used = np.mean(used_links_f2q) if used_links_f2q else 1.0
+
                 schedule_plan.append({
                     "task_id": task.id,
                     "mapping": mapping,
@@ -182,7 +369,9 @@ class QuMCScheduler(BaseScheduler):
                     "end_time": batch_start_time + duration,
                     "num_swaps": num_swaps,
                     "final_fidelity": fidelity,
-                    "crosstalk_score": crosstalk_within_batch  # <-- 使用正确计算的值
+                    "crosstalk_score": crosstalk_within_batch,  # <-- 使用正确计算的值
+                    "avg_f1q_used": avg_f1q_used,  # <--- 新增
+                    "avg_f2q_used": avg_f2q_used
                 })
                 pbar.update(1)
 
@@ -294,18 +483,79 @@ class RLScheduler(BaseScheduler):
                     final_mask = placement_mask | connectivity_mask
                     logits[0, final_mask] = -1e8
 
-                    action = torch.argmax(logits, dim=1)
+                    # 使用带温度的采样，既保留了贪心倾向，又允许一定的并行探索
+                    temperature = 0.1  # 温度越低越接近贪心，越高越随机。0.1是一个不错的起点。
+                    probs = torch.softmax(logits / temperature, dim=-1)
+                    action = Categorical(probs).sample()
+
                     physical_qubit_id = env.idx_to_qubit_id[action.item()]
                     placement_in_progress[i] = physical_qubit_id
 
                 final_mapping = placement_in_progress
+
+                # --- 3.使用 Qiskit SABRE 计算真实 SWAP ---
+                # a. 重建 Qiskit 线路
+                qc = QuantumCircuit(current_task.num_qubits)
+                for u, v in current_task.interaction_graph.edges():
+                    qc.cx(u, v)
+
+                # b. 构建基于所选分区的 CouplingMap
+                # 我们需要将全局物理ID转换为分区内的局部索引 (0..k-1)
+                # 这样 transpile 才能在这个子图上运行
+                partition_nodes = list(final_mapping.values())  # [(r,c), ...]
+                local_idx_to_physical_id = {i: pid for i, pid in enumerate(partition_nodes)}
+                # 反向映射：为了构建 coupling list
+                physical_id_to_local_idx = {pid: i for i, pid in enumerate(partition_nodes)}
+
+                partition_coupling_list = []
+                for u_pid in partition_nodes:
+                    for v_pid in partition_nodes:
+                        if u_pid == v_pid: continue
+                        if v_pid in env.chip_model[u_pid].connectivity:
+                            # 添加边：(local_u, local_v)
+                            partition_coupling_list.append(
+                                [physical_id_to_local_idx[u_pid], physical_id_to_local_idx[v_pid]])
+
+                # c. 构建初始映射 (Layout)
+                # 因为我们是在局部子图上跑，逻辑比特 i 应该被映射到局部索引为 i 的物理比特上
+                # (假设 RL 是按 0..k-1 的顺序放置的，且 final_mapping[i] 就是第 i 个物理比特)
+                # 所以 initial_layout 就是平凡的 [0, 1, ..., k-1]
+                initial_layout = list(range(current_task.num_qubits))
+
+                real_num_swaps = 0
+                try:
+                    if partition_coupling_list:
+                        transpiled_qc = transpile(
+                            qc,
+                            coupling_map=CouplingMap(partition_coupling_list),
+                            initial_layout=initial_layout,
+                            routing_method='sabre',
+                            optimization_level=3
+                        )
+                        real_num_swaps = transpiled_qc.count_ops().get('swap', 0)
+                    else:
+                        # 如果分区不连通且有CNOT，SWAP会很多
+                        if current_task.interaction_graph.number_of_edges() > 0:
+                            real_num_swaps = 100  # 惩罚值
+                except Exception as e:
+                    print(f"SABRE failed for task {task_id}: {e}")
+                    real_num_swaps = 100  # 失败惩罚
+
+                # --- 4. 提交计划 (传入真实 SWAP) ---
                 start_time = max(env.chip_model[pid].get_next_available_time() for pid in
                                  final_mapping.values()) if final_mapping else 0.0
-                full_action = {"task_id": task_id, "mapping": final_mapping, "start_time": start_time}
+
+                full_action = {
+                    "task_id": task_id,
+                    "mapping": final_mapping,
+                    "start_time": start_time,
+                    "override_swaps": real_num_swaps  # <--- 将真实值传递给 env.step
+                }
+
                 _, _, terminated, _, _ = env.step(full_action)
 
                 if terminated: break
-        return env.schedule_plan
+            return env.schedule_plan
 
 
 class SequentialScheduler(BaseScheduler):
@@ -344,7 +594,7 @@ class SequentialScheduler(BaseScheduler):
                 continue
 
             # 3. 在找到的最佳分区内进行映射
-            mapping, num_swaps = self._map_to_partition(task, best_partition, env)
+            mapping, num_swaps = map_to_partition_sarbe(task, best_partition, env)
 
             # 4. 计算时间并添加到调度计划
             # 核心逻辑：下一个任务的开始时间 = 上一个任务的结束时间
@@ -357,12 +607,24 @@ class SequentialScheduler(BaseScheduler):
             # 串行执行没有并行串扰
             crosstalk_score = 0
 
+            # --- 计算细粒度保真度 ---
+            avg_f1q_used = np.mean([env.chip_model[pid].fidelity_1q for pid in mapping.values()])
+
+            used_links_f2q = []
+            for u, v in task.interaction_graph.edges():
+                p_u, p_v = mapping[u], mapping[v]
+                if p_v in env.chip_model[p_u].connectivity:
+                    used_links_f2q.append(env.chip_model[p_u].connectivity[p_v]['fidelity_2q'])
+            avg_f2q_used = np.mean(used_links_f2q) if used_links_f2q else 1.0
+
             schedule_plan.append({
                 "task_id": task.id, "mapping": mapping,
                 "start_time": start_time, "end_time": end_time,
                 "num_swaps": num_swaps,
                 "final_fidelity": final_fidelity,
-                "crosstalk_score": crosstalk_score
+                "crosstalk_score": crosstalk_score,
+                "avg_f1q_used": avg_f1q_used,
+                "avg_f2q_used": avg_f2q_used
             })
 
             # 更新时间，为下一个任务做准备
@@ -409,7 +671,7 @@ class SequentialScheduler(BaseScheduler):
         return best_partition
 
     def _map_to_partition(self, task, partition, env):
-        # (此处的代码与您之前实现的 QuMCScheduler._map_to_partition 完全相同)
+        # (QuMCScheduler._map_to_partition 完全相同)
         mapping, num_swaps = {}, 0
         sorted_logical = sorted(task.interaction_graph.degree, key=lambda x: x[1], reverse=True)
         available_physical = list(partition)
@@ -526,7 +788,7 @@ class GreedyScheduler(BaseScheduler):
 
                 if best_partition:
                     # 在分区内进行映射 (可以复用之前的逻辑)
-                    mapping, num_swaps = self._map_to_partition(task, best_partition, env)
+                    mapping, num_swaps = map_to_partition_sarbe(task, best_partition, env)
                     batch_to_schedule.append({'task': task, 'mapping': mapping, 'swaps': num_swaps})
                     temp_used_qubits.update(best_partition)
                 else:
@@ -567,6 +829,15 @@ class GreedyScheduler(BaseScheduler):
                                 if p_id2 in env.chip_model[p_id1].connectivity:
                                     crosstalk_within_batch += env.chip_model[p_id1].connectivity[p_id2]['crosstalk_coeff']
 
+                    avg_f1q_used = np.mean([env.chip_model[pid].fidelity_1q for pid in mapping.values()])
+
+                    used_links_f2q = []
+                    for u, v in task.interaction_graph.edges():
+                        p_u, p_v = mapping[u], mapping[v]
+                        if p_v in env.chip_model[p_u].connectivity:
+                            used_links_f2q.append(env.chip_model[p_u].connectivity[p_v]['fidelity_2q'])
+                    avg_f2q_used = np.mean(used_links_f2q) if used_links_f2q else 1.0
+
                     schedule_plan.append({
                         "task_id": task.id,
                         "mapping": mapping,
@@ -574,7 +845,9 @@ class GreedyScheduler(BaseScheduler):
                         "end_time": batch_start_time + duration,
                         "num_swaps": item['num_swaps'],
                         "final_fidelity": env._estimate_swaps_and_fidelity(task, mapping,crosstalk_within_batch)[1],
-                        "crosstalk_score": crosstalk_within_batch  # <-- 使用正确计算的值
+                        "crosstalk_score": crosstalk_within_batch,
+                        "avg_f1q_used": avg_f1q_used,
+                        "avg_f2q_used": avg_f2q_used
                     })
                 pbar.update(1)
 
@@ -618,8 +891,10 @@ def calculate_metrics(schedule_plan: list) -> dict:
     avg_swaps = np.mean([item['num_swaps'] for item in schedule_plan])
     avg_fidelity = np.mean([item['final_fidelity'] for item in schedule_plan])
     total_crosstalk = sum(item['crosstalk_score'] for item in schedule_plan)
+    avg_f1q = np.mean([item.get('avg_f1q_used', 0) for item in schedule_plan])
+    avg_f2q = np.mean([item.get('avg_f2q_used', 0) for item in schedule_plan])
     return {"makespan": makespan, "avg_swaps": avg_swaps, "avg_fidelity": avg_fidelity,
-            "total_crosstalk": total_crosstalk}
+            "total_crosstalk": total_crosstalk, "avg_f1q_used": avg_f1q, "avg_f2q_used": avg_f2q}
 
 
 if __name__ == '__main__':
@@ -653,7 +928,7 @@ if __name__ == '__main__':
     # --- 实例化所有要对比的调度器 ---
     schedulers_to_run = [
         SequentialScheduler(),
-        GreedyScheduler(),
+        # GreedyScheduler(),
         QuMCScheduler(),
         RLScheduler(
             model_path=script_args.model_path,
@@ -713,3 +988,15 @@ if __name__ == '__main__':
     # 调用新的绘图函数
     plot_path = os.path.join(eval_dir, "schedule_comparison_all.png")
     plot_all_schedules(plans, args.CHIP_SIZE, save_path=plot_path)
+
+    # --- 生成切面视图 ---
+    # 选择一个有趣的时间点，比如 Makespan 的 1/4 或 1/3 处，那时通常并发度最高
+    # 或者你可以手动指定，比如 5000
+    rl_plan = plans["Reinforcement Learning Scheduler"]
+    if rl_plan:
+        total_makespan = results["Reinforcement Learning Scheduler"]["makespan"]
+        snapshot_time = 5000  # 或者 total_makespan * 0.2
+
+        snapshot_save_path = os.path.join(eval_dir, f"snapshot_{snapshot_time}us.png")
+        plot_chip_snapshot(rl_plan, args.CHIP_SIZE, snapshot_time, save_path=snapshot_save_path)
+

@@ -371,10 +371,18 @@ class QuantumSchedulingEnv(gym.Env):
         # 5. 汇总所有错误
         # 注意：crosstalk_error 是直接加在总错误上的
         # 因为 E_total = E_base + E_crosstalk
-        total_error = error_1q + error_2q_native + error_swap + crosstalk_error
+        real_crosstalk_error = crosstalk_error * 0.1
 
+        total_error = error_1q + error_2q_native + error_swap + crosstalk_error
+        print("error_1q:", error_1q)
+        print("error_2q_native:", error_2q_native)
+        print("error_swap:", error_swap)
+        print("real_crosstalk_error:", real_crosstalk_error)
+
+        total_error = total_error * 0.5
         # 计算最终保真度
         final_fidelity = np.exp(-total_error)
+        print("final_fidelity",final_fidelity)
 
         return num_swaps, final_fidelity
 
@@ -448,6 +456,17 @@ class QuantumSchedulingEnv(gym.Env):
         start_time = action["start_time"]
         mapping = action["mapping"]
 
+        # 计算平均单比特门保真度 (Avg 1Q Fidelity Used)
+        avg_f1q_used = np.mean([self.chip_model[pid].fidelity_1q for pid in mapping.values()])
+        # 计算平均双比特门保真度 (Avg 2Q Fidelity Used)
+        # 只计算映射后实际使用的物理链接
+        used_links_f2q = []
+        for u, v in task.interaction_graph.edges():
+            p_u, p_v = mapping[u], mapping[v]
+            if p_v in self.chip_model[p_u].connectivity:
+                used_links_f2q.append(self.chip_model[p_u].connectivity[p_v]['fidelity_2q'])
+        avg_f2q_used = np.mean(used_links_f2q) if used_links_f2q else 1.0  # 如果没有2Q门则为1
+
         duration_no_swap = task.estimated_duration
         end_time_est = start_time + duration_no_swap  # 临时结束时间用于估算串扰
 
@@ -456,6 +475,8 @@ class QuantumSchedulingEnv(gym.Env):
         # --- 3. 计算所有物理相关的指标 ---
         # a. 估算SWAP和基础保真度
         num_swaps, final_fidelity = self._estimate_swaps_and_fidelity(task, mapping, crosstalk_error_sum)
+        if "override_swaps" in action:
+            num_swaps = action["override_swaps"]
 
         # b. 计算因SWAP增加的额外时长
         duration_penalty_swap = num_swaps * self.swap_penalty["duration"] / 1e3  # us
@@ -475,6 +496,8 @@ class QuantumSchedulingEnv(gym.Env):
             "start_time": start_time,
             "end_time": end_time,
             "num_swaps": num_swaps,
+            "avg_f1q_used": avg_f1q_used,
+            "avg_f2q_used": avg_f2q_used,
             "final_fidelity": final_fidelity,
             "crosstalk_score": crosstalk_score
         }

@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import numpy as np
 import os
+import matplotlib.patches as patches
 
 
 def plot_schedule(schedule_plan: list,
@@ -281,3 +282,79 @@ def plot_all_schedules(plans: Dict[str, List[Dict]],
 
     plt.close(fig)
 
+
+def plot_chip_snapshot(schedule_plan, chip_size, snapshot_time, save_path=None):
+    """
+    绘制特定时间点 (snapshot_time) 的芯片任务分布切面图。
+    """
+    rows, cols = chip_size
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # 1. 绘制芯片网格背景
+    for r in range(rows):
+        for c in range(cols):
+            # 绘制物理比特圆圈
+            circle = patches.Circle((c, rows - 1 - r), 0.3, edgecolor='gray', facecolor='white', linewidth=2,
+                                    zorder=1)
+            ax.add_patch(circle)
+            # 绘制连接线 (简化为网格线)
+            if c < cols - 1:
+                ax.plot([c, c + 1], [rows - 1 - r, rows - 1 - r], color='gray', linewidth=1, zorder=0)
+            if r < rows - 1:
+                ax.plot([c, c], [rows - 1 - r, rows - 1 - (r + 1)], color='gray', linewidth=1, zorder=0)
+
+            # 标注比特坐标
+            ax.text(c, rows - 1 - r, f"({r},{c})", ha='center', va='center', fontsize=8, color='black', zorder=2)
+
+    # 2. 找出在 snapshot_time 正在运行的任务
+    active_tasks = []
+    for item in schedule_plan:
+        if item['start_time'] <= snapshot_time < item['end_time']:
+            active_tasks.append(item)
+
+    # 3. 绘制活跃任务
+    # 为每个任务分配颜色
+    task_ids = sorted(list(set(item['task_id'] for item in schedule_plan)))
+    cmap = plt.cm.get_cmap('viridis', len(task_ids)) if task_ids else None
+
+    print(f"\n--- Snapshot at {snapshot_time} us ---")
+    print(f"Active tasks: {[t['task_id'] for t in active_tasks]}")
+
+    for item in active_tasks:
+        task_id = item['task_id']
+        color = cmap(task_ids.index(task_id))
+
+        # 获取该任务占用的物理比特
+        mapped_qubits = item['mapping'].values()  # [(r1, c1), (r2, c2), ...]
+
+        # 在对应的物理比特上绘制彩色圆圈
+        for (r, c) in mapped_qubits:
+            # 注意坐标变换：矩阵行r对应Y轴从上到下，所以Y = rows - 1 - r
+            circle = patches.Circle((c, rows - 1 - r), 0.25, color=color, zorder=3)
+            ax.add_patch(circle)
+            # 标注任务ID
+            ax.text(c, rows - 1 - r, f"T{task_id}", ha='center', va='center', fontsize=10, color='white',
+                    weight='bold', zorder=4)
+
+    # 设置图形属性
+    ax.set_xlim(-0.5, cols - 0.5)
+    ax.set_ylim(-0.5, rows - 0.5)
+    ax.set_aspect('equal')
+    ax.axis('off')
+    ax.set_title(f"Chip Snapshot at T = {snapshot_time} us", fontsize=16)
+
+    # 添加图例 (可选，显示所有活跃任务)
+    if active_tasks:
+        handles = [patches.Patch(color=cmap(task_ids.index(t['task_id'])), label=f"Task {t['task_id']}") for t in
+                   active_tasks]
+        ax.legend(handles=handles, loc='center left', bbox_to_anchor=(1, 0.5))
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Snapshot saved to {save_path}")
+    else:
+        plt.show()
+
+    plt.close(fig)
