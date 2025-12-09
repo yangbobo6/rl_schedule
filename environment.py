@@ -31,6 +31,7 @@ class QuantumSchedulingEnv(gym.Env):
         self.max_qubits_per_task = max_qubits_per_task  # 用于定义观察空间
         self.reward_weights = reward_weights
         self.hardware_graph = nx.Graph()
+        self.gate_times = gate_times
 
         # --- GNN编码器 (用于将任务交互图编码为向量) ---
         # 在实际项目中，这会是一个预训练或端到端训练的PyTorch/TensorFlow模型
@@ -158,7 +159,7 @@ class QuantumSchedulingEnv(gym.Env):
                     if neighbor_id in chip:
                         # 模拟连接质量
                         f_2q = 0.99 - 0.02 * np.random.random()
-                        crosstalk = 0.05 + 0.1 * np.random.random()
+                        crosstalk = 0.001 + 0.02 * np.random.random()
                         chip[q_id].add_link(neighbor_id, f_2q, crosstalk)
                         chip[neighbor_id].add_link(q_id, f_2q, crosstalk)  # 双向连接
         return chip

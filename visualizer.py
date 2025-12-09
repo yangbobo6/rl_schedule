@@ -10,7 +10,8 @@ from matplotlib.patches import Rectangle
 import numpy as np
 import os
 import matplotlib.patches as patches
-
+import pandas as pd
+import seaborn as sns
 
 def plot_schedule(schedule_plan: list,
                   chip_size: tuple,
@@ -358,3 +359,44 @@ def plot_chip_snapshot(schedule_plan, chip_size, snapshot_time, save_path=None):
         plt.show()
 
     plt.close(fig)
+
+
+def plot_comparison_charts(all_results, save_dir):
+    """绘制带有误差条的对比柱状图"""
+    metrics = ["makespan", "avg_swaps", "avg_fidelity", "total_crosstalk"]
+    metric_titles = ["Makespan (us)", "Avg SWAPs per Task", "Avg Task Fidelity", "Total Crosstalk Score"]
+
+    sns.set(style="whitegrid")
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    axes = axes.flatten()
+
+    # 准备 DataFrame 以利用 seaborn 的绘图功能
+    data_rows = []
+    for algo_name, metrics_data in all_results.items():
+        num_samples = len(metrics_data["makespan"])
+        for i in range(num_samples):
+            row = {"Algorithm": algo_name}
+            for m in metrics:
+                if i < len(metrics_data[m]):
+                    row[m] = metrics_data[m][i]
+                else:
+                    row[m] = np.nan
+            data_rows.append(row)
+
+    df = pd.DataFrame(data_rows)
+
+    for i, metric in enumerate(metrics):
+        ax = axes[i]
+        # 绘制柱状图，Seaborn 会自动计算均值和置信区间（误差条）
+        sns.barplot(x="Algorithm", y=metric, data=df, ax=ax, capsize=.1, palette="viridis")
+
+        ax.set_title(metric_titles[i], fontsize=14, fontweight='bold')
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        # 旋转 x 轴标签以防重叠
+        ax.tick_params(axis='x', rotation=15)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "batch_comparison_metrics.png"), dpi=300)
+    print(f"Comparison charts saved to {save_dir}")
+    plt.close()
