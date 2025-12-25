@@ -400,3 +400,75 @@ def plot_comparison_charts(all_results, save_dir):
     plt.savefig(os.path.join(save_dir, "batch_comparison_metrics.png"), dpi=300)
     print(f"Comparison charts saved to {save_dir}")
     plt.close()
+
+
+def plot_micro_batch_schedule(tasks_data, chip_size, save_path=None):
+    """
+    绘制 H-SAMeS-Q 生成的微批级调度图 (物理比特视图)。
+    纵轴为物理比特，横轴为时间。
+    """
+    num_qubits = chip_size[0] * chip_size[1]
+    fig, ax = plt.subplots(figsize=(24, 12))  # 增加宽度以展示细节
+
+    # Y轴设置：物理比特
+    ax.set_ylim(-0.5, num_qubits - 0.5)
+    ax.set_yticks(np.arange(num_qubits))
+    ax.set_yticklabels([f"Q({i // chip_size[1]},{i % chip_size[1]})" for i in range(num_qubits)])
+    ax.set_ylabel("Physical Qubit", fontsize=14)
+    ax.set_xlabel("Time (us)", fontsize=14)
+    ax.set_title("H-SAMeS-Q Micro-batch Schedule (Physical View)", fontsize=18)
+
+    # 物理ID到Y轴索引的映射
+    phys_to_y = {(r, c): r * chip_size[1] + c for r in range(chip_size[0]) for c in range(chip_size[1])}
+
+    # 颜色映射
+    task_ids = sorted([t['id'] for t in tasks_data])
+    cmap = plt.cm.get_cmap('tab20', len(task_ids)) if task_ids else None
+    task_colors = {tid: cmap(i) for i, tid in enumerate(task_ids)} if task_ids else {}
+
+    max_end_time = 0
+
+    for task in tasks_data:
+        tid = task['id']
+        color = task_colors.get(tid, 'gray')
+
+        # 获取该任务占用的所有物理比特的Y轴位置
+        # 注意：occupied_qubits 可能是 set 或 list，且元素是 (r,c) 元组
+        y_indices = [phys_to_y[p] for p in task['occupied_qubits']]
+
+        for batch in task['shots_schedule']:
+            start = batch['start']
+            end = batch['end']
+            duration = end - start
+            num_shots = batch['num_shots']
+            max_end_time = max(max_end_time, end)
+
+            # 在每个占用的比特上绘制矩形
+            for y in y_indices:
+                rect = Rectangle(
+                    (start, y - 0.4), duration, 0.8,
+                    facecolor=color, edgecolor='black', alpha=0.8, linewidth=0.5
+                )
+                ax.add_patch(rect)
+
+                # 仅在最上面的一个比特上显示文字，避免拥挤
+                if y == max(y_indices) and duration > 50:  # 只有足够宽才显示
+                    label_text = f"T{tid}\nB={num_shots}"
+                    ax.text(start + duration / 2, y, label_text,
+                            ha='center', va='center', color='white', fontsize=7, fontweight='bold')
+
+    ax.set_xlim(0, max_end_time * 1.02)
+    ax.grid(axis='x', linestyle=':', alpha=0.5)
+
+    # 添加图例
+    handles = [Rectangle((0, 0), 1, 1, color=task_colors[tid], label=f"Task {tid}") for tid in task_ids]
+    # 将图例放在图外，避免遮挡
+    ax.legend(handles=handles, loc='upper left', bbox_to_anchor=(1, 1), title="Tasks")
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+        print(f"H-SAMeS-Q schedule plot saved to {save_path}")
+    else:
+        plt.show()
+    plt.close(fig)

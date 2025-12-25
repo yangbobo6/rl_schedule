@@ -22,6 +22,7 @@ from run import Hyperparameters  # 从run.py导入超参数类
 from qiskit import QuantumCircuit, transpile
 from qiskit.transpiler import CouplingMap, Layout
 from visualizer import plot_all_schedules, plot_chip_snapshot
+from models.hsamesq_scheduler import HSAMeSQScheduler
 
 
 # ==============================================================================
@@ -127,7 +128,7 @@ def map_to_partition_sarbe(task, partition, env):
 
 
 class QuMCScheduler(BaseScheduler):
-    def __init__(self, epsilon=0.1):
+    def __init__(self, epsilon=100):
         super().__init__("QuMC-style Heuristic")
         self.epsilon = epsilon  # 保真度差异阈值
 
@@ -349,54 +350,86 @@ class QuMCScheduler(BaseScheduler):
 
     def _calculate_qumc_fidelity_score(self, task, mapping, env, crosstalk_within_batch, num_swaps):
         """
-        混合保真度计算模型：
-        1. 基础物理错误 (1Q + 2Q + SWAP) 采用标准物理模型。
-        2. 串扰影响采用 QuMC 源码逻辑：直接修正 2Q 门的平均错误率。
+        修正版保真度计算：
+        1. 利用了交互图的边权重 (CNOT次数)。
+        2. 修复了物理不连通时忽略CNOT错误的Bug。
+        3. 串扰被建模为对平均物理错误率的修正。
         """
 
-        # --- 1. 计算 1Q 门错误 ---
-        # 遍历映射中使用的所有物理比特
+        # --- 0. 准备工作：计算分区的物理基准 ---
+        # 我们先看看这块物理区域的“底子”如何
+        partition_nodes = list(mapping.values())
+        phys_link_errors = []
+
+        # 遍历分区内所有可能的物理连接
+        for p_u in partition_nodes:
+            for p_v in partition_nodes:
+                if p_v in env.chip_model[p_u].connectivity:
+                    # 收集该区域所有物理连线的错误率
+                    phys_link_errors.append(1.0 - env.chip_model[p_u].connectivity[p_v]['fidelity_2q'])
+
+        # 计算分区的平均物理错误率
+        if phys_link_errors:
+            avg_phys_error = np.mean(phys_link_errors)
+            num_phys_links = len(phys_link_errors)
+        else:
+            avg_phys_error = 0.05  # 默认回退值
+            num_phys_links = 1
+
+        # --- 1. 融入串扰修正 ---
+        # 串扰会提高这块区域的平均错误率
+        # 既然 crosstalk_within_batch 是系数之和，我们将其平均分摊到每条物理连线上
+        # 乘以 0.1 是为了将“系数和”转换为“概率增量” (经验值)
+        crosstalk_penalty_rate = (crosstalk_within_batch * 0.1) / num_phys_links
+
+        # 修正后的有效平均错误率 (Effective Error Rate)
+        # 这将用于计算 SWAP 和 那些没有直接物理连接的 CNOT
+        effective_avg_error = avg_phys_error + crosstalk_penalty_rate
+
+        # --- 2. 计算 1Q 门错误 ---
         error_1q_sum = 0.0
         for pid in mapping.values():
-            # 假设每个比特平均分担了任务中的单比特门
-            # 如果 task 没有 num_1q_gates 属性，可以用 task.depth * task.num_qubits * 0.5 估算
-            avg_gates_per_qubit = getattr(task, 'num_1q_gates', task.depth * task.num_qubits) / task.num_qubits
+            # 如果任务对象里有统计好的 num_1q_gates，就用它，否则估算
+            # 假设 1Q 门也是均匀分布的
+            num_1q = getattr(task, 'num_1q_gates', 0)
+            if num_1q == 0: num_1q = task.depth * task.num_qubits  # 回退估算
+
+            avg_gates_per_qubit = num_1q / task.num_qubits
             error_1q_sum += avg_gates_per_qubit * (1.0 - env.chip_model[pid].fidelity_1q)
 
-        # --- 2. 计算 2Q 门基础错误 ---
-        cnot_error_sum = 0.0
-        num_cnot_edges = 0
+        # --- 3. 计算 2Q 门错误 (逻辑门) ---
+        error_2q_sum = 0.0
 
-        for u, v in task.interaction_graph.edges():
+        # 遍历逻辑交互图的边
+        # data 中包含了我们之前存入的 'weight' (CNOT次数)
+        for u, v, data in task.interaction_graph.edges(data=True):
+            count = data.get('weight', 1)  # 获取该边的CNOT次数
+
             p_u, p_v = mapping[u], mapping[v]
+
             if p_v in env.chip_model[p_u].connectivity:
-                base_error = 1.0 - env.chip_model[p_u].connectivity[p_v]['fidelity_2q']
-                cnot_error_sum += base_error
-                num_cnot_edges += 1
+                # Case A: 物理上直接连通
+                # 使用这条物理连线特定的错误率 + 串扰修正
+                specific_link_error = (1.0 - env.chip_model[p_u].connectivity[p_v]['fidelity_2q'])
+                # 我们假设串扰是均匀的，或者你可以只加在这一项上
+                current_error = specific_link_error + crosstalk_penalty_rate
+                error_2q_sum += count * current_error
+            else:
+                # Case B: 物理上不连通 (Bug修复点)
+                # 这些门不会消失，它们会在路由后的某个地方执行
+                # 最佳估算就是使用当前分区的“有效平均错误率”
+                error_2q_sum += count * effective_avg_error
 
-        # --- 3. 融入 QuMC 串扰逻辑 ---
-        # QuMC 将串扰直接加到 CNOT 错误和中
-        # crosstalk_within_batch 已经是所有受影响边的串扰系数之和
-        total_cnot_error_sum = cnot_error_sum + crosstalk_within_batch
-
-        # 计算修正后的平均 CNOT 错误率
-        avg_cnot_error = total_cnot_error_sum / num_cnot_edges if num_cnot_edges > 0 else 0.0
-
-        # --- 4. 计算总错误 (含 SWAP) ---
-        # 原始 CNOT 错误
-        num_original_cnots = task.interaction_graph.number_of_edges()
-        error_2q_total = num_original_cnots * avg_cnot_error
-
-        # SWAP 错误
-        # 每个 SWAP = 3 个 CNOT
-        # 我们假设 SWAP 操作也受到同样的平均错误率（含串扰）的影响
-        error_swap = num_swaps * 3 * avg_cnot_error
+        # --- 4. 计算 SWAP 错误 ---
+        # SWAP = 3 * CNOT
+        # SWAP 操作是在这块物理区域内进行的，所以使用 effective_avg_error
+        error_swap_sum = num_swaps * 3 * effective_avg_error
 
         # --- 5. 最终汇总 ---
-        total_error_score = error_1q_sum + error_2q_total + error_swap
+        total_error = error_1q_sum + error_2q_sum + error_swap_sum
 
         # 转换为保真度
-        final_fidelity = np.exp(-total_error_score)
+        final_fidelity = np.exp(-total_error)
 
         return final_fidelity
 
@@ -424,7 +457,6 @@ class QuMCScheduler(BaseScheduler):
 
     def schedule(self, env: QuantumSchedulingEnv) -> list:
         print(f"\n--- Running {self.name} ---")
-        env.reset()
 
         all_tasks = list(env.task_pool.values())
         # 1. 任务排序 (QuMC: 按 CNOT 密度)
@@ -1174,7 +1206,7 @@ if __name__ == '__main__':
     print("="*63)
     # --- 实例化所有要对比的调度器 ---
     schedulers_to_run = [
-        SequentialScheduler(),
+        # SequentialScheduler(),
         # GreedyScheduler(),
         QuMCScheduler(),
         RLScheduler(
@@ -1184,8 +1216,14 @@ if __name__ == '__main__':
         )
     ]
 
+    # 设定评估用的 Shots 数量
+    SHOTS = 1000
+
     results = {}
     plans = {}
+
+    # 临时变量，用于保存 RL 的环境实例，供 MAMS 使用
+    rl_env_instance = None
 
     for scheduler in schedulers_to_run:
         env = QuantumSchedulingEnv(
@@ -1198,22 +1236,63 @@ if __name__ == '__main__':
         results[scheduler.name] = calculate_metrics(plan)
         plans[scheduler.name] = plan
 
-        # --- 打印和保存对比结果 (这部分代码现在可以自动适应任意数量的调度器) ---
-        print("\n\n" + "=" * 30 + " FINAL COMPARISON RESULTS " + "=" * 30)
+        # 保存 RL 的环境实例
+        if scheduler.name == "Reinforcement Learning Scheduler":
+            rl_env_instance = env
 
-        scheduler_names = list(results.keys())
-        header = f"| {'Metric':<21} |" + "".join([f" {name:<20} |" for name in scheduler_names])
-        print(header)
-        print(f"|{'-' * 23}|" + "".join([f"{'-' * 22}|" for name in scheduler_names]))
+    rl_plan = plans["Reinforcement Learning Scheduler"]
+    # 从 results 字典中获取 rl_results
+    rl_results = results["Reinforcement Learning Scheduler"]
 
-        metrics_to_display = ["makespan", "avg_swaps", "avg_fidelity", "total_crosstalk"]
-        for metric in metrics_to_display:
-            row = f"| {metric:<21} |"
-            for name in scheduler_names:
-                value = results.get(name, {}).get(metric, 0)
-                row += f" {value:>20.4f} |"
-            print(row)
-        print("=" * len(header))
+    # --- H-SAMeS-Q 后处理优化 ---
+    if "Reinforcement Learning Scheduler" in plans and rl_env_instance:
+        print("\n" + "=" * 20 + " H-SAMeS-Q OPTIMIZATION " + "=" * 20)
+
+        # 实例化调度器
+        # 可以通过 config 调整微批参数
+        hsamesq = HSAMeSQScheduler(rl_env_instance, config={'B_MIN': 10, 'B_MAX': 50})
+
+        # 运行调度
+        SHOTS = 1000
+        hsamesq_results = hsamesq.schedule(rl_plan, shots_per_task=SHOTS)
+
+        print(f"\n--- H-SAMeS-Q Results ---")
+        print(f"Original RL Makespan (1 shot): {rl_results['makespan']:.2f} us")
+        print(f"Naive Linear Makespan ({SHOTS} shots): {rl_results['makespan'] * SHOTS:.2f} us")
+        print(f"H-SAMeS-Q Optimized Makespan ({SHOTS} shots): {hsamesq_results['makespan']:.2f} us")
+
+        improvement = (1 - hsamesq_results['makespan'] / (rl_results['makespan'] * SHOTS)) * 100
+        print(f"Improvement over Linear: {improvement:.2f}%")
+
+        # ... (保存结果逻辑) ...
+
+        # 绘制 H-SAMeS-Q 的微观甘特图
+        # 由于 shot 数太多，画出每一个 shot 不现实
+        # 我们画出“微批 (Micro-batch)”级别的甘特图
+
+        from visualizer import plot_micro_batch_schedule
+
+        eval_dir = f"results/"
+
+        plot_path = os.path.join(eval_dir, "hsamesq_schedule.png")
+        plot_micro_batch_schedule(hsamesq_results['tasks'], args.CHIP_SIZE, save_path=plot_path)
+
+    # --- 打印和保存对比结果 (这部分代码现在可以自动适应任意数量的调度器) ---
+    print("\n\n" + "=" * 30 + " FINAL COMPARISON RESULTS " + "=" * 30)
+
+    scheduler_names = list(results.keys())
+    header = f"| {'Metric':<21} |" + "".join([f" {name:<25} |" for name in scheduler_names]) # 稍微调宽列宽
+    print(header)
+    print(f"|{'-' * 23}|" + "".join([f"{'-' * 27}|" for name in scheduler_names]))
+
+    metrics_to_display = ["makespan", "avg_swaps", "avg_fidelity", "total_crosstalk"]
+    for metric in metrics_to_display:
+        row = f"| {metric:<21} |"
+        for name in scheduler_names:
+            value = results.get(name, {}).get(metric, 0)
+            row += f" {value:>25.4f} |"
+        print(row)
+    print("=" * len(header))
 
     eval_timestamp = time.strftime("%Y%m%d-%H%M%S")
     eval_dir = f"results/evaluation_{eval_timestamp}"
@@ -1229,7 +1308,6 @@ if __name__ == '__main__':
                 {k: (str(v) if isinstance(v, dict) else v) for k, v in item.items()}
                 for item in plan
             ]
-        json.dump({"results": results, "plans": serializable_plans}, f, indent=4)
     print(f"\nComparison data saved to {os.path.join(eval_dir, 'comparison.json')}")
 
     # 调用新的绘图函数
@@ -1239,8 +1317,8 @@ if __name__ == '__main__':
     # --- 生成切面视图 ---
     # 选择一个有趣的时间点，比如 Makespan 的 1/4 或 1/3 处，那时通常并发度最高
     # 或者你可以手动指定，比如 5000
-    rl_plan = plans["Reinforcement Learning Scheduler"]
-    if rl_plan:
+    if "Reinforcement Learning Scheduler" in plans:
+        rl_plan = plans["Reinforcement Learning Scheduler"]
         total_makespan = results["Reinforcement Learning Scheduler"]["makespan"]
         snapshot_time = 5000  # 或者 total_makespan * 0.2
 

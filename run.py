@@ -40,7 +40,9 @@ class Hyperparameters:
     MINI_BATCH_SIZE = 256  # 使用更大的批次以获得更稳定的梯度
 
     # --- GNN参数 ---
-    GNN_NODE_DIM = 1
+    GNN_TASK_NODE_DIM = 2
+    GNN_CHIP_NODE_DIM = 1
+
     GNN_HIDDEN_DIM = 32
     GNN_OUTPUT_DIM = 16
 
@@ -113,8 +115,6 @@ class ActorCritic(nn.Module):
         return action_logits, state_value
 
 
-from models.selector import SiameseGNNSelector
-
 # --- 4. 主函数 ---
 def main():
 
@@ -153,26 +153,11 @@ def main():
 
     # 1. 初始化GNN模型
     gnn_model = GNNEncoder(
-        node_feature_dim=args.GNN_NODE_DIM,
+        node_feature_dim=args.GNN_TASK_NODE_DIM,
         hidden_dim=args.GNN_HIDDEN_DIM,
         output_dim=args.GNN_OUTPUT_DIM
     ).to(device)
     gnn_model.eval()  # 我们只用它来编码，不训练
-
-    # b. GNN选择器 (用于任务选择)
-    print("Loading pre-trained GNN Selector...")
-    gnn_selector = SiameseGNNSelector(
-        chip_node_dim=1, task_node_dim=1,  # 节点特征维度
-        hidden_dim=64, embed_dim=32
-    ).to(device)
-    try:
-        gnn_selector.load_state_dict(torch.load("models/gnn_selector_v0.pth", map_location=device))
-    except FileNotFoundError:
-        print("Warning: GNN Selector model not found. Task selection will be random.")
-        gnn_selector = None  # 如果找不到模型，则退化为随机选择
-    if gnn_selector:
-        gnn_selector.eval()
-
 
     gate_times = {
         'u3': 50, 'u': 50, 'p': 30, 'cx': 350, 'id': 30,
@@ -256,30 +241,11 @@ def main():
         episode_crosstalks = []
 
         for task_id in range(env.num_tasks):
-            # === 1. 任务选择决策 (由GNN完成) ===
+            # === 1. 顺序选择 ===
             candidate_tasks = env.get_candidate_tasks()
             if not candidate_tasks: break  # 如果没有可选任务，提前结束
-
-            if gnn_selector:
-                chip_graph_data = env.get_chip_state_graph_data()
-                task_graph_data_list = [networkx_to_pyg_data(t.interaction_graph) for t in candidate_tasks]
-
-                scores = []
-                with torch.no_grad():
-                    # 为了高效，我们将所有候选任务打包成一个batch进行预测
-                    chip_batch = Batch.from_data_list([chip_graph_data] * len(candidate_tasks)).to(device)
-                    task_batch = Batch.from_data_list(task_graph_data_list).to(device)
-
-                    scores = gnn_selector(chip_batch, task_batch).cpu().numpy().flatten()
-
-                # 选择分数最高的任务
-                chosen_task_local_index = np.argmax(scores)
-                chosen_task = candidate_tasks[chosen_task_local_index]
-                task_id = chosen_task.id
-            else:
-                # 如果没有GNN选择器，则随机选择一个
-                chosen_task = np.random.choice(candidate_tasks)
-                task_id = chosen_task.id
+            chosen_task = np.random.choice(candidate_tasks)
+            task_id = chosen_task.id
 
             # === 2. 任务放置决策 (由RL完成) ===
             current_task = env.task_pool[task_id]
@@ -500,24 +466,7 @@ def main():
                         # === 1. 任务选择 (GNN Selector - 贪心模式) ===
                         candidate_tasks = env.get_candidate_tasks()
                         if not candidate_tasks: break
-
-                        chip_graph_data = env.get_chip_state_graph_data()
-
-                        # 如果GNN选择器存在，则使用它
-                        if gnn_selector:
-                            task_graph_data_list = [networkx_to_pyg_data(t.interaction_graph) for t in candidate_tasks]
-
-                            chip_batch = Batch.from_data_list([chip_graph_data] * len(candidate_tasks)).to(device)
-                            task_batch = Batch.from_data_list(task_graph_data_list).to(device)
-
-                            scores = gnn_selector(chip_batch, task_batch).cpu().numpy().flatten()
-
-                            # 选择分数最高的任务
-                            chosen_task_local_index = np.argmax(scores)
-                            chosen_task = candidate_tasks[chosen_task_local_index]
-                        else:
-                            # 降级为随机选择
-                            chosen_task = np.random.choice(candidate_tasks)
+                        chosen_task = np.random.choice(candidate_tasks)
 
                         val_task_id = chosen_task.id
 

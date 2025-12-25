@@ -33,6 +33,14 @@ class QuantumSchedulingEnv(gym.Env):
         self.hardware_graph = nx.Graph()
         self.gate_times = gate_times
 
+        # 定义测量线拓扑
+        # 假设每一行共用一条测量线 (Multiplexed Readout)
+        # readout_map: physical_qubit_id -> readout_line_id
+        self.readout_map = {}
+        for r in range(self.chip_size[0]):
+            for c in range(self.chip_size[1]):
+                self.readout_map[(r, c)] = r  # 第r行对应第r条测量线
+
         # --- GNN编码器 (用于将任务交互图编码为向量) ---
         # 在实际项目中，这会是一个预训练或端到端训练的PyTorch/TensorFlow模型
         # 这里我们用一个虚拟的实现代替
@@ -104,6 +112,15 @@ class QuantumSchedulingEnv(gym.Env):
             "placement_mask": spaces.Box(low=0, high=1, shape=(self.num_qubits,), dtype=np.int8),
             "logical_qubit_context": spaces.Box(low=0, high=self.max_qubits_per_task, shape=(D_LOGICAL_CONTEXT,), dtype=np.float32)
         })
+
+    def get_task_readout_lines(self, mapping: dict) -> set:
+        """根据任务的映射，获取它占用的测量线集合"""
+        lines = set()
+        for phys_id in mapping.values():
+            if phys_id in self.readout_map:
+                lines.add(self.readout_map[phys_id])
+        return lines
+
 
     def get_candidate_tasks(self) -> list:
         """返回所有当前未被调度的任务对象列表。"""

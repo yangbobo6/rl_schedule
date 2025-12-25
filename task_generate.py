@@ -151,13 +151,31 @@ class TaskGenerator:
         interaction_graph = nx.Graph()
         interaction_graph.add_nodes_from(range(num_qubits))
 
+        # 使用一个字典来统计边出现的次数
+        edge_counts = {}
+        node_gate_counts = {i: 0 for i in range(num_qubits)}  # 记录每个节点参与的总门数
+
         for instruction in decomposed_circuit.data:
             q_indices = [decomposed_circuit.qubits.index(q) for q in instruction.qubits]
+
+            # 更新节点门数
+            for q_idx in q_indices:
+                node_gate_counts[q_idx] += 1
 
             if len(q_indices) > 1:
                 from itertools import combinations
                 for u, v in combinations(q_indices, 2):
-                    interaction_graph.add_edge(u, v)
+                    # 排序以保证 (u,v) 和 (v,u) 是同一个键
+                    edge = tuple(sorted((u, v)))
+                    edge_counts[edge] = edge_counts.get(edge, 0) + 1
+
+                # 将权重添加到图中
+        for (u, v), count in edge_counts.items():
+            interaction_graph.add_edge(u, v, weight=count)  # <--- 添加权重属性
+
+        # 添加节点属性
+        nx.set_node_attributes(interaction_graph, node_gate_counts, "gate_count")  # <--- 关键：节点特征
+
         if task_id<5:
             plt.figure()  # 创建一个新画布，这是一个好习惯
             nx.draw(interaction_graph, with_labels=True, node_color='skyblue', edge_color='gray')
