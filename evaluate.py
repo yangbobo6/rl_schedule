@@ -3,6 +3,7 @@ import argparse
 import time
 from typing import Dict
 
+from models.hsamesq_scheduler_v2 import HSAMeSQSchedulerV2
 from task_generate import TaskGenerator
 import torch
 import numpy as np
@@ -128,7 +129,7 @@ def map_to_partition_sarbe(task, partition, env):
 
 
 class QuMCScheduler(BaseScheduler):
-    def __init__(self, epsilon=100):
+    def __init__(self, epsilon=1):
         super().__init__("QuMC-style Heuristic")
         self.epsilon = epsilon  # 保真度差异阈值
 
@@ -739,10 +740,6 @@ class RLScheduler(BaseScheduler):
     def schedule(self, env: QuantumSchedulingEnv) -> list:
         print(f"\n--- Running {self.name} ---")
 
-        gnn_selector = SiameseGNNSelector(chip_node_dim=1, task_node_dim=1, hidden_dim=64, embed_dim=32).to(self.device)
-        gnn_selector.load_state_dict(torch.load(self.gnn_selector_path, map_location=self.device))
-        gnn_selector.eval()
-
         rl_placer = TransformerActorCritic(
             env.observation_space, env.num_qubits,
             d_model=self.args.D_MODEL, nhead=self.args.N_HEAD, num_encoder_layers=self.args.NUM_ENCODER_LAYERS
@@ -757,15 +754,7 @@ class RLScheduler(BaseScheduler):
                 candidate_tasks = env.get_candidate_tasks()
                 if not candidate_tasks: break
 
-                chip_graph_data = env.get_chip_state_graph_data()
-                task_graph_data_list = [networkx_to_pyg_data(t.interaction_graph) for t in candidate_tasks]
-
-                chip_batch = Batch.from_data_list([chip_graph_data] * len(candidate_tasks)).to(self.device)
-                task_batch = Batch.from_data_list(task_graph_data_list).to(self.device)
-                scores = gnn_selector(chip_batch, task_batch).cpu().numpy().flatten()
-
-                chosen_task_local_index = np.argmax(scores)
-                chosen_task = candidate_tasks[chosen_task_local_index]
+                chosen_task = candidate_tasks[0]
                 task_id = chosen_task.id
 
                 current_task = env.task_pool[task_id]
@@ -1176,6 +1165,101 @@ def calculate_metrics(schedule_plan: list) -> dict:
             "total_crosstalk": total_crosstalk, "avg_f1q_used": avg_f1q, "avg_f2q_used": avg_f2q}
 
 
+def calculate_mams_fidelity(mams_results: dict, env: QuantumSchedulingEnv) -> tuple:
+    print("\n--- Calculating Precise Fidelity for MAMS Schedule ---")
+
+    tasks_data = mams_results['tasks']
+
+    # 建立索引
+    rl_plan_map = {item['task_id']: item for item in env.schedule_plan}
+
+    # 1. 展开所有微批
+    all_batches = []
+    for t_data in tasks_data:
+        tid = t_data['id']
+        if tid not in rl_plan_map: continue
+
+        mapping = rl_plan_map[tid]['mapping']
+
+        for batch in t_data['shots_schedule']:
+            all_batches.append({
+                'task_id': tid,
+                'start': batch['start'],
+                'end': batch['end'],
+                'num_shots': batch['num_shots'],
+                'mapping': mapping
+            })
+
+    # 按时间排序优化检查速度
+    all_batches.sort(key=lambda x: x['start'])
+
+    total_fidelity_sum = 0
+    total_shots_count = 0
+    task_fidelities = {}
+
+    # 2. 遍历计算
+    # 注意：双重循环 O(N^2) 在微批很多时会慢。对于 demo 还可以。
+    for i, batch_i in enumerate(tqdm(all_batches, desc="Evaluating Fidelity")):
+        tid_i = batch_i['task_id']
+        mapping_i = batch_i['mapping']
+        task_i = env.task_pool[tid_i]
+
+        # a. 基础静态保真度 (含 SWAP 错误)
+        # 我们可以复用 env 中的方法，因为它只依赖 mapping
+        _, base_fidelity = env._estimate_swaps_and_fidelity(task_i, mapping_i,crosstalk_error=0.0)
+
+        # b. 读出错误
+        readout_fidelity = np.prod([env.chip_model[pid].fidelity_readout for pid in mapping_i.values()])
+
+        # c. 动态串扰 (微观层面)
+        crosstalk_sum = 0.0
+
+        for j, batch_j in enumerate(all_batches):
+            if i == j: continue
+
+            # 快速时间过滤
+            if batch_j['end'] <= batch_i['start']: continue  # j 在 i 之前结束
+            if batch_j['start'] >= batch_i['end']: continue  # j 在 i 之后开始
+
+            # 有时间重叠，检查空间串扰
+            mapping_j = batch_j['mapping']
+
+            for p_i in mapping_i.values():
+                for p_j in mapping_j.values():
+                    if p_j in env.chip_model[p_i].connectivity:
+                        crosstalk_sum += env.chip_model[p_i].connectivity[p_j]['crosstalk_coeff']
+
+        # d. 综合计算
+        # 系数 0.1 是一个经验值，模拟串扰对错误率的贡献比例
+        crosstalk_decay = np.exp(-crosstalk_sum * 0.1)
+
+        # 最终单次 shot 的保真度
+        batch_fidelity = base_fidelity * readout_fidelity * crosstalk_decay
+
+        # e. 累加权重
+        weight = batch_i['num_shots']
+
+        if tid_i not in task_fidelities:
+            task_fidelities[tid_i] = {'total_fid': 0, 'total_shots': 0}
+
+        task_fidelities[tid_i]['total_fid'] += batch_fidelity * weight
+        task_fidelities[tid_i]['total_shots'] += weight
+
+        total_fidelity_sum += batch_fidelity * weight
+        total_shots_count += weight
+
+    final_avg_fidelity = total_fidelity_sum / total_shots_count if total_shots_count > 0 else 0
+
+    # 计算每个任务的平均保真度
+    final_task_fidelities = {
+        tid: data['total_fid'] / data['total_shots']
+        for tid, data in task_fidelities.items()
+    }
+
+    return final_avg_fidelity, final_task_fidelities
+
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Evaluate and compare quantum scheduling algorithms.")
     parser.add_argument("--model_path", type=str, required=True,
@@ -1187,7 +1271,7 @@ if __name__ == '__main__':
 
     print("Creating a fixed evaluation environment...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    gnn_for_task_gen = GNNEncoder(args.GNN_NODE_DIM, args.GNN_HIDDEN_DIM, args.GNN_OUTPUT_DIM).to(device)
+    gnn_for_task_gen = GNNEncoder(args.GNN_TASK_NODE_DIM, args.GNN_HIDDEN_DIM, args.GNN_OUTPUT_DIM).to(device)
     gate_times = {'u3': 50, 'u': 50, 'p': 30, 'cx': 350, 'id': 30, 'measure': 1000, 'rz': 30, 'sx': 40, 'x': 40}
 
     temp_env = QuantumSchedulingEnv(
@@ -1215,9 +1299,6 @@ if __name__ == '__main__':
             args=args
         )
     ]
-
-    # 设定评估用的 Shots 数量
-    SHOTS = 1000
 
     results = {}
     plans = {}
@@ -1250,11 +1331,18 @@ if __name__ == '__main__':
 
         # 实例化调度器
         # 可以通过 config 调整微批参数
-        hsamesq = HSAMeSQScheduler(rl_env_instance, config={'B_MIN': 10, 'B_MAX': 50})
+        # hsamesq = HSAMeSQScheduler(rl_env_instance, config={'B_MIN': 10, 'B_MAX': 50})
+        hsamesq = HSAMeSQSchedulerV2(rl_env_instance, config={'B_MIN': 10, 'B_MAX': 50})
 
         # 运行调度
         SHOTS = 1000
-        hsamesq_results = hsamesq.schedule(rl_plan, shots_per_task=SHOTS)
+        hsamesq_results = hsamesq.schedule(rl_plan, shots_per_task=None)
+
+        mams_avg_fidelity, _ = calculate_mams_fidelity(hsamesq_results, rl_env_instance)
+
+        avg_shots = np.mean([t.shots for t in rl_env_instance.task_pool.values()])
+        print(f"Average Shots: {avg_shots:.1f}")
+        print(f"Average Fidelity: {mams_avg_fidelity:.3f}")
 
         print(f"\n--- H-SAMeS-Q Results ---")
         print(f"Original RL Makespan (1 shot): {rl_results['makespan']:.2f} us")
@@ -1262,9 +1350,9 @@ if __name__ == '__main__':
         print(f"H-SAMeS-Q Optimized Makespan ({SHOTS} shots): {hsamesq_results['makespan']:.2f} us")
 
         improvement = (1 - hsamesq_results['makespan'] / (rl_results['makespan'] * SHOTS)) * 100
-        print(f"Improvement over Linear: {improvement:.2f}%")
+        # print(f"Improvement over Linear: {improvement:.2f}%")
 
-        # ... (保存结果逻辑) ...
+        # ... 保存结果...
 
         # 绘制 H-SAMeS-Q 的微观甘特图
         # 由于 shot 数太多，画出每一个 shot 不现实
@@ -1333,7 +1421,8 @@ def evaluate_batch(schedulers, base_env, num_episodes=50, chip_size=(6, 6), num_
     print(f"\n=== Starting Batch Evaluation ({num_episodes} episodes) ===")
 
     # 存储所有结果: {scheduler_name: {metric: [val1, val2, ...]}}
-    all_results = {name: {"makespan": [], "avg_swaps": [], "avg_fidelity": [], "total_crosstalk": []}
+    # all_results = {name: {"makespan": [], "avg_swaps": [], "avg_fidelity": [], "total_crosstalk": []}
+    all_results = {name: {"makespan": [], "avg_swaps": [], "avg_fidelity": []}
                    for name in [s.name for s in schedulers]}
 
     for episode_idx in tqdm(range(num_episodes), desc="Evaluating Episodes"):

@@ -392,10 +392,10 @@ class QuantumSchedulingEnv(gym.Env):
         real_crosstalk_error = crosstalk_error * 0.1
 
         total_error = error_1q + error_2q_native + error_swap + crosstalk_error
-        print("error_1q:", error_1q)
-        print("error_2q_native:", error_2q_native)
-        print("error_swap:", error_swap)
-        print("real_crosstalk_error:", real_crosstalk_error)
+        # print("error_1q:", error_1q)
+        # print("error_2q_native:", error_2q_native)
+        # print("error_swap:", error_swap)
+        # print("real_crosstalk_error:", real_crosstalk_error)
 
         total_error = total_error * 0.5
         # 计算最终保真度

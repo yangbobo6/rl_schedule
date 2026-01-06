@@ -1,5 +1,6 @@
 # 文件: task_generator.py
 import os
+import random
 
 import torch
 import numpy as np
@@ -131,7 +132,8 @@ class TaskGenerator:
         # --- b. 提取基本信息 ---
         num_qubits = decomposed_circuit.num_qubits
         depth = decomposed_circuit.depth()
-        shots = 1024
+
+        shots = random.choice([500, 1000, 2000])
 
         gate_counts = decomposed_circuit.count_ops()
         num_1q_gates = 0

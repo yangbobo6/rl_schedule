@@ -56,18 +56,20 @@ class HSAMeSQScheduler:
                     compatibility_matrix[i][j] = False
                     continue
 
+                compatibility_matrix[i][j] = True
+
                     # --- 2. 检查测量线冲突 ---
-                lines_i = task_lines[i]
-                lines_j = task_lines[j]
-
-                # 规则：不冲突 OR 包含关系
-                is_readout_disjoint = lines_i.isdisjoint(lines_j)
-                is_subset = lines_i.issubset(lines_j) or lines_j.issubset(lines_i)
-
-                if is_readout_disjoint or is_subset:
-                    compatibility_matrix[i][j] = True
-                else:
-                    compatibility_matrix[i][j] = False
+                # lines_i = task_lines[i]
+                # lines_j = task_lines[j]
+                #
+                # # 规则：不冲突 OR 包含关系
+                # is_readout_disjoint = lines_i.isdisjoint(lines_j)
+                # is_subset = lines_i.issubset(lines_j) or lines_j.issubset(lines_i)
+                #
+                # if is_readout_disjoint or is_subset:
+                #     compatibility_matrix[i][j] = True
+                # else:
+                #     compatibility_matrix[i][j] = False
 
         return compatibility_matrix, task_lines
 
